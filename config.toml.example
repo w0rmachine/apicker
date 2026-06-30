@@ -1,0 +1,18 @@
+# apicker configuration example
+# Copy this file to ~/.config/apicker/config.toml to customize.
+
+[[sources]]
+name = "ssh"
+icon = "network-server"
+description = "SSH Connection Launcher"
+# Extracts hosts from ~/.ssh/config and starts foot terminal running ssh
+script = "awk '/^Host [^*]/ {print $2}' ~/.ssh/config 2>/dev/null || echo 'localhost'"
+action = "foot -e ssh {item}"
+
+[[sources]]
+name = "bitwarden"
+icon = "security-high"
+description = "Bitwarden Passwords (wl-copy)"
+# Lists vault names and copies the chosen password to Wayland clipboard
+script = "bw list items 2>/dev/null | jq -r '.[] | .name' || echo 'Vault Locked'"
+action = "bw get password \"{item}\" | wl-copy"
