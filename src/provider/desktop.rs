@@ -13,12 +13,26 @@ impl Provider for DesktopProvider {
         let mut results = Vec::new();
         let matcher = SkimMatcherV2::default();
 
-        let dirs = vec![
-            PathBuf::from("/usr/share/applications/"),
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("/home/mwu/.local/share"))
-                .join("applications/"),
-        ];
+        let mut dirs = Vec::new();
+
+        // User-specific applications
+        if let Some(local_dir) = dirs::data_local_dir() {
+            dirs.push(local_dir.join("applications"));
+        } else {
+            dirs.push(PathBuf::from("/home/mwu/.local/share/applications"));
+        }
+
+        // System-wide and profile applications
+        if let Ok(xdg_data_dirs) = std::env::var("XDG_DATA_DIRS") {
+            for dir in xdg_data_dirs.split(':') {
+                if !dir.is_empty() {
+                    dirs.push(PathBuf::from(dir).join("applications"));
+                }
+            }
+        } else {
+            dirs.push(PathBuf::from("/usr/local/share/applications"));
+            dirs.push(PathBuf::from("/usr/share/applications"));
+        }
 
         for dir in dirs {
             if let Ok(entries) = fs::read_dir(dir) {
