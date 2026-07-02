@@ -35,20 +35,35 @@ impl Provider for DesktopProvider {
             app_dirs.push(PathBuf::from("/usr/share/applications"));
         }
 
+        let mut seen_filenames = std::collections::HashSet::new();
+
         for dir in app_dirs {
             if let Ok(entries) = fs::read_dir(dir) {
                 for entry in entries.filter_map(Result::ok) {
                     let path = entry.path();
                     if path.extension().and_then(|e| e.to_str()) == Some("desktop") {
-                        if let Some(item) = parse_desktop_file(&path, query, matcher, mru) {
-                            results.push(item);
+                        if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+                            if seen_filenames.insert(filename.to_string()) {
+                                if let Some(item) = parse_desktop_file(&path, query, matcher, mru) {
+                                    results.push(item);
+                                }
+                            }
                         }
                     }
                 }
             }
         }
 
-        results
+        // Deduplicate by exec path to catch any edge cases where different filenames have same exec
+        let mut unique_results = Vec::new();
+        let mut seen_execs = std::collections::HashSet::new();
+        for item in results {
+            if seen_execs.insert(item.path.clone()) {
+                unique_results.push(item);
+            }
+        }
+
+        unique_results
     }
 }
 
