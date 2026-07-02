@@ -11,7 +11,8 @@ pub struct MruCache {
 impl MruCache {
     fn file_path() -> PathBuf {
         dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))
+            .expect("Could not determine cache directory")
             .join("apicker")
             .join("mru.json")
     }

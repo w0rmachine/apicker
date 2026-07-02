@@ -13,6 +13,16 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// MRU boost multiplier — each recent-use count adds this much to the score.
+pub const MRU_BOOST_FACTOR: i64 = 50;
+
+/// Base score for source submenu entries so they rank above regular results.
+const SOURCE_BASE_SCORE: i64 = 1000;
+
+/// Bonus range for shorter source names (shorter = higher priority).
+const SOURCE_NAME_LENGTH_BASE: i64 = 10;
+
+
 #[derive(Parser, Debug)]
 #[command(name = "apicker")]
 #[command(about = "A fast, scriptable file picker backend in Rust", long_about = None)]
@@ -76,7 +86,7 @@ struct SourceConfig {
 
 fn load_config() -> Config {
     let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("/home/mwu/.config"))
+        .expect("Could not determine config directory")
         .join("apicker");
 
     let config_path = config_dir.join("config.toml");
@@ -131,6 +141,12 @@ fn run_source_script(script: &str) -> std::io::Result<Vec<String>> {
     Ok(items)
 }
 
+/// Shell-escape a string by wrapping it in single quotes with proper escaping.
+fn shell_escape(s: &str) -> String {
+    // Replace each ' with '\'' (end quote, escaped quote, start quote)
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn main() {
     let cli = Cli::parse();
     let config = load_config();
@@ -154,39 +170,35 @@ fn main() {
             if let Some(source_name) = source {
                 if source_name == "desktop" {
                     let desktop_provider = DesktopProvider;
-                    results.extend(desktop_provider.fetch(&query, &mru));
+                    results.extend(desktop_provider.fetch(&query, &mru, &matcher));
                 } else if source_name == "files" {
                     let files_provider = FilesProvider {
                         ignore_dirs: &config.ignore_dirs,
                     };
-                    results.extend(files_provider.fetch(&query, &mru));
+                    results.extend(files_provider.fetch(&query, &mru, &matcher));
                 } else if let Some(src_config) = config.sources.iter().find(|s| s.name == source_name) {
                     match run_source_script(&src_config.script) {
                         Ok(items) => {
                             for item in items {
                                 let count = mru.get(&item);
-                                let boost = (count * 50) as i64;
-                                if let Some(s) = matcher.fuzzy_match(&item, &query) {
-                                    results.push(PickerItem {
-                                        text: item.clone(),
-                                        path: item,
-                                        icon: src_config.icon.clone(),
-                                        is_dir: false,
-                                        is_submenu: false,
-                                        target_source: None,
-                                        score: s + boost,
-                                    });
+                                let boost = (count as i64) * MRU_BOOST_FACTOR;
+                                let score = if let Some(s) = matcher.fuzzy_match(&item, &query) {
+                                    s + boost
                                 } else if query.is_empty() {
-                                    results.push(PickerItem {
-                                        text: item.clone(),
-                                        path: item,
-                                        icon: src_config.icon.clone(),
-                                        is_dir: false,
-                                        is_submenu: false,
-                                        target_source: None,
-                                        score: boost,
-                                    });
-                                }
+                                    boost
+                                } else {
+                                    continue;
+                                };
+
+                                results.push(PickerItem {
+                                    text: item.clone(),
+                                    path: item,
+                                    icon: src_config.icon.clone(),
+                                    is_dir: false,
+                                    is_submenu: false,
+                                    target_source: None,
+                                    score,
+                                });
                             }
                         }
                         Err(e) => {
@@ -197,22 +209,18 @@ fn main() {
                     eprintln!("Source '{}' not found in configuration.", source_name);
                 }
             } else {
-                let show_sources = query.is_empty() || query.starts_with(':');
-                let search_query = if query.starts_with(':') {
-                    query.trim_start_matches(':').to_string()
-                } else {
-                    query.clone()
-                };
+                let search_query = query.strip_prefix(':').unwrap_or(&query);
+                let show_sources = query.is_empty() || search_query.len() < query.len();
 
                 if show_sources {
                     for src in &config.sources {
                         let matches = search_query.is_empty()
-                            || matcher.fuzzy_match(&src.name, &search_query).is_some();
+                            || matcher.fuzzy_match(&src.name, search_query).is_some();
                         if matches {
                             let display_desc =
                                 src.description.as_deref().unwrap_or("Custom Script Source");
                             let count = mru.get(&src.name);
-                            let boost = (count * 50) as i64;
+                            let boost = (count as i64) * MRU_BOOST_FACTOR;
                             results.push(PickerItem {
                                 text: format!("Source: {} ({})", src.name, display_desc),
                                 path: src.name.clone(),
@@ -220,19 +228,19 @@ fn main() {
                                 is_dir: false,
                                 is_submenu: true,
                                 target_source: Some(src.name.clone()),
-                                score: 1000 + (10 - src.name.len() as i64) + boost,
+                                score: SOURCE_BASE_SCORE + (SOURCE_NAME_LENGTH_BASE - src.name.len() as i64) + boost,
                             });
                         }
                     }
                 }
 
                 let desktop_provider = DesktopProvider;
-                results.extend(desktop_provider.fetch(&search_query, &mru));
+                results.extend(desktop_provider.fetch(search_query, &mru, &matcher));
 
                 let files_provider = FilesProvider {
                     ignore_dirs: &config.ignore_dirs,
                 };
-                results.extend(files_provider.fetch(&search_query, &mru));
+                results.extend(files_provider.fetch(search_query, &mru, &matcher));
             }
 
             results.sort_by(|a, b| {
@@ -259,7 +267,8 @@ fn main() {
 
             if let Some(src_name) = source {
                 if let Some(src_config) = config.sources.iter().find(|s| s.name == src_name) {
-                    let expanded_cmd = src_config.action.replace("{item}", &item);
+                    let escaped_item = shell_escape(&item);
+                    let expanded_cmd = src_config.action.replace("{item}", &escaped_item);
                     match std::process::Command::new("sh")
                         .arg("-c")
                         .arg(&expanded_cmd)

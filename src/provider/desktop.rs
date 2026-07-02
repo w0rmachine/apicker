@@ -6,40 +6,41 @@ use fuzzy_matcher::FuzzyMatcher;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::MRU_BOOST_FACTOR;
+
 pub struct DesktopProvider;
 
 impl Provider for DesktopProvider {
-    fn fetch(&self, query: &str, mru: &MruCache) -> Vec<PickerItem> {
+    fn fetch(&self, query: &str, mru: &MruCache, matcher: &SkimMatcherV2) -> Vec<PickerItem> {
         let mut results = Vec::new();
-        let matcher = SkimMatcherV2::default();
 
-        let mut dirs = Vec::new();
+        let mut app_dirs = Vec::new();
 
         // User-specific applications
         if let Some(local_dir) = dirs::data_local_dir() {
-            dirs.push(local_dir.join("applications"));
-        } else {
-            dirs.push(PathBuf::from("/home/mwu/.local/share/applications"));
+            app_dirs.push(local_dir.join("applications"));
+        } else if let Some(home) = dirs::home_dir() {
+            app_dirs.push(home.join(".local/share/applications"));
         }
 
         // System-wide and profile applications
         if let Ok(xdg_data_dirs) = std::env::var("XDG_DATA_DIRS") {
             for dir in xdg_data_dirs.split(':') {
                 if !dir.is_empty() {
-                    dirs.push(PathBuf::from(dir).join("applications"));
+                    app_dirs.push(PathBuf::from(dir).join("applications"));
                 }
             }
         } else {
-            dirs.push(PathBuf::from("/usr/local/share/applications"));
-            dirs.push(PathBuf::from("/usr/share/applications"));
+            app_dirs.push(PathBuf::from("/usr/local/share/applications"));
+            app_dirs.push(PathBuf::from("/usr/share/applications"));
         }
 
-        for dir in dirs {
+        for dir in app_dirs {
             if let Ok(entries) = fs::read_dir(dir) {
                 for entry in entries.filter_map(Result::ok) {
                     let path = entry.path();
                     if path.extension().and_then(|e| e.to_str()) == Some("desktop") {
-                        if let Some(item) = parse_desktop_file(&path, query, &matcher, mru) {
+                        if let Some(item) = parse_desktop_file(&path, query, matcher, mru) {
                             results.push(item);
                         }
                     }
@@ -70,16 +71,26 @@ fn parse_desktop_file(
             continue;
         }
         if line.starts_with('[') {
-            in_desktop_entry = false;
+            if in_desktop_entry {
+                // We've left [Desktop Entry], no need to parse further sections
+                break;
+            }
+            continue;
         }
 
         if in_desktop_entry {
-            if line.starts_with("Name=") && name.is_empty() {
-                name = line["Name=".len()..].to_string();
-            } else if line.starts_with("Icon=") && icon.is_empty() {
-                icon = line["Icon=".len()..].to_string();
-            } else if line.starts_with("Exec=") && exec.is_empty() {
-                exec = line["Exec=".len()..].to_string();
+            if let Some(val) = line.strip_prefix("Name=") {
+                if name.is_empty() {
+                    name = val.to_string();
+                }
+            } else if let Some(val) = line.strip_prefix("Icon=") {
+                if icon.is_empty() {
+                    icon = val.to_string();
+                }
+            } else if let Some(val) = line.strip_prefix("Exec=") {
+                if exec.is_empty() {
+                    exec = val.to_string();
+                }
             }
         }
     }
@@ -88,7 +99,7 @@ fn parse_desktop_file(
         return None;
     }
 
-    // Strip %u, %F, etc.
+    // Strip %u, %F, etc. field codes
     let exec = exec
         .replace("%u", "")
         .replace("%U", "")
@@ -101,7 +112,7 @@ fn parse_desktop_file(
         .to_string();
 
     let count = mru.get(&exec);
-    let boost = (count * 50) as i64;
+    let boost = (count as i64) * MRU_BOOST_FACTOR;
 
     let score = if query.is_empty() {
         boost

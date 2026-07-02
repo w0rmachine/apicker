@@ -8,44 +8,49 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::MRU_BOOST_FACTOR;
+
 pub struct FilesProvider<'a> {
     pub ignore_dirs: &'a [String],
 }
 
+struct CacheEntry {
+    path: String,
+    is_dir: bool,
+}
+
 impl<'a> Provider for FilesProvider<'a> {
-    fn fetch(&self, query: &str, mru: &MruCache) -> Vec<PickerItem> {
+    fn fetch(&self, query: &str, mru: &MruCache, matcher: &SkimMatcherV2) -> Vec<PickerItem> {
         let mut results = Vec::new();
-        let matcher = SkimMatcherV2::default();
 
         match load_cache(self.ignore_dirs) {
-            Ok(paths) => {
-                for path_str in paths {
-                    let path = Path::new(&path_str);
+            Ok(entries) => {
+                for entry in entries {
+                    let path = Path::new(&entry.path);
                     let file_name = path
                         .file_name()
                         .map(|f| f.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path_str.clone());
+                        .unwrap_or_else(|| entry.path.clone());
 
-                    let count = mru.get(&path_str);
-                    let boost = (count * 50) as i64;
+                    let count = mru.get(&entry.path);
+                    let boost = (count as i64) * MRU_BOOST_FACTOR;
 
                     let (score, match_target) = if let Some(s) = matcher.fuzzy_match(&file_name, query) {
                         (s + boost, file_name)
-                    } else if let Some(s) = matcher.fuzzy_match(&path_str, query) {
-                        (s - 10 + boost, path_str.clone())
+                    } else if let Some(s) = matcher.fuzzy_match(&entry.path, query) {
+                        (s - 10 + boost, entry.path.clone())
                     } else if query.is_empty() {
                         (boost, file_name)
                     } else {
                         continue;
                     };
 
-                    let is_dir = path.is_dir();
-                    let icon = determine_icon(path, is_dir);
+                    let icon = determine_icon(path, entry.is_dir);
                     results.push(PickerItem {
                         text: match_target,
-                        path: path_str,
+                        path: entry.path,
                         icon,
-                        is_dir,
+                        is_dir: entry.is_dir,
                         is_submenu: false,
                         target_source: None,
                         score,
@@ -61,9 +66,10 @@ impl<'a> Provider for FilesProvider<'a> {
     }
 }
 
-pub fn get_cache_dir() -> PathBuf {
+fn get_cache_dir() -> PathBuf {
     dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))
+        .expect("Could not determine cache directory")
         .join("apicker")
 }
 
@@ -93,26 +99,44 @@ pub fn rebuild_cache(root_dir: &Path, ignore_dirs: &[String]) -> io::Result<Vec<
         .filter_map(|e| e.ok())
     {
         let path_str = entry.path().to_string_lossy().into_owned();
-        writeln!(file, "{}", path_str)?;
+        let type_flag = if entry.file_type().is_dir() { 'D' } else { 'F' };
+        writeln!(file, "{}\t{}", path_str, type_flag)?;
         paths.push(path_str);
     }
     Ok(paths)
 }
 
-fn load_cache(ignore_dirs: &[String]) -> io::Result<Vec<String>> {
+fn load_cache(ignore_dirs: &[String]) -> io::Result<Vec<CacheEntry>> {
     let cache_file_path = get_cache_file();
     if !cache_file_path.exists() {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        return rebuild_cache(&home, ignore_dirs);
+        rebuild_cache(&home, ignore_dirs)?;
+        // Re-read the freshly built cache
+        return load_cache_from_file(&cache_file_path);
     }
 
-    let file = File::open(cache_file_path)?;
+    load_cache_from_file(&cache_file_path)
+}
+
+fn load_cache_from_file(path: &Path) -> io::Result<Vec<CacheEntry>> {
+    let file = File::open(path)?;
     let reader = BufReader::new(file);
-    let mut paths = Vec::new();
-    for path in reader.lines().map_while(Result::ok) {
-        paths.push(path);
+    let mut entries = Vec::new();
+    for line in reader.lines().map_while(Result::ok) {
+        if let Some((path_str, flag)) = line.rsplit_once('\t') {
+            entries.push(CacheEntry {
+                path: path_str.to_string(),
+                is_dir: flag == "D",
+            });
+        } else {
+            // Backwards compatibility: old cache format without type flag
+            entries.push(CacheEntry {
+                path: line,
+                is_dir: false,
+            });
+        }
     }
-    Ok(paths)
+    Ok(entries)
 }
 
 fn determine_icon(path: &Path, is_dir: bool) -> String {
