@@ -3,15 +3,23 @@ use crate::mru::MruCache;
 use crate::provider::Provider;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::MRU_BOOST_FACTOR;
 
+const CACHE_FORMAT_VERSION: u32 = 2;
+const DEFAULT_CACHE_TTL_SECONDS: u64 = 60 * 60;
+
 pub struct FilesProvider<'a> {
     pub ignore_dirs: &'a [String],
+    pub root_dir: Option<&'a Path>,
+    pub cache_ttl_seconds: Option<u64>,
 }
 
 struct CacheEntry {
@@ -19,11 +27,20 @@ struct CacheEntry {
     is_dir: bool,
 }
 
+#[derive(Serialize, Deserialize)]
+struct CacheMetadata {
+    version: u32,
+    root: String,
+    ignore_dirs: Vec<String>,
+    root_modified: Option<u64>,
+    built_at: u64,
+}
+
 impl<'a> Provider for FilesProvider<'a> {
     fn fetch(&self, query: &str, mru: &MruCache, matcher: &SkimMatcherV2) -> Vec<PickerItem> {
         let mut results = Vec::new();
 
-        match load_cache(self.ignore_dirs) {
+        match load_cache(self.root_dir, self.ignore_dirs, self.cache_ttl_seconds) {
             Ok(entries) => {
                 for entry in entries {
                     let path = Path::new(&entry.path);
@@ -35,15 +52,16 @@ impl<'a> Provider for FilesProvider<'a> {
                     let count = mru.get(&entry.path);
                     let boost = (count as i64) * MRU_BOOST_FACTOR;
 
-                    let (score, match_target) = if let Some(s) = matcher.fuzzy_match(&file_name, query) {
-                        (s + boost, file_name)
-                    } else if let Some(s) = matcher.fuzzy_match(&entry.path, query) {
-                        (s - 10 + boost, entry.path.clone())
-                    } else if query.is_empty() {
-                        (boost, file_name)
-                    } else {
-                        continue;
-                    };
+                    let (score, match_target) =
+                        if let Some(s) = matcher.fuzzy_match(&file_name, query) {
+                            (s + boost, file_name)
+                        } else if let Some(s) = matcher.fuzzy_match(&entry.path, query) {
+                            (s - 10 + boost, entry.path.clone())
+                        } else if query.is_empty() {
+                            (boost, file_name)
+                        } else {
+                            continue;
+                        };
 
                     let icon = determine_icon(path, entry.is_dir);
                     results.push(PickerItem {
@@ -77,11 +95,16 @@ pub fn get_cache_file() -> PathBuf {
     get_cache_dir().join("paths.txt")
 }
 
+fn get_cache_meta_file() -> PathBuf {
+    get_cache_dir().join("paths.json")
+}
+
 pub fn rebuild_cache(root_dir: &Path, ignore_dirs: &[String]) -> io::Result<Vec<String>> {
     let cache_dir = get_cache_dir();
     fs::create_dir_all(&cache_dir)?;
     let cache_file_path = get_cache_file();
-    let mut file = File::create(&cache_file_path)?;
+    let cache_file_tmp = temporary_path_for(&cache_file_path);
+    let mut file = File::create(&cache_file_tmp)?;
 
     let mut paths = Vec::new();
     for entry in WalkDir::new(root_dir)
@@ -91,7 +114,10 @@ pub fn rebuild_cache(root_dir: &Path, ignore_dirs: &[String]) -> io::Result<Vec<
             if file_name.starts_with('.') && file_name != "." {
                 return false;
             }
-            if ignore_dirs.iter().any(|ignore| ignore == file_name.as_ref()) {
+            if ignore_dirs
+                .iter()
+                .any(|ignore| ignore == file_name.as_ref())
+            {
                 return false;
             }
             true
@@ -103,19 +129,39 @@ pub fn rebuild_cache(root_dir: &Path, ignore_dirs: &[String]) -> io::Result<Vec<
         writeln!(file, "{}\t{}", path_str, type_flag)?;
         paths.push(path_str);
     }
+    file.flush()?;
+    fs::rename(cache_file_tmp, cache_file_path)?;
+
+    write_cache_metadata(root_dir, ignore_dirs)?;
     Ok(paths)
 }
 
-fn load_cache(ignore_dirs: &[String]) -> io::Result<Vec<CacheEntry>> {
+fn load_cache(
+    root_dir: Option<&Path>,
+    ignore_dirs: &[String],
+    cache_ttl_seconds: Option<u64>,
+) -> io::Result<Vec<CacheEntry>> {
     let cache_file_path = get_cache_file();
-    if !cache_file_path.exists() {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        rebuild_cache(&home, ignore_dirs)?;
-        // Re-read the freshly built cache
-        return load_cache_from_file(&cache_file_path);
+    let root_dir = root_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_cache_root);
+
+    if should_rebuild_cache(&root_dir, ignore_dirs, cache_ttl_seconds) {
+        rebuild_cache(&root_dir, ignore_dirs)?;
     }
 
-    load_cache_from_file(&cache_file_path)
+    match load_cache_from_file(&cache_file_path) {
+        Ok(entries) => Ok(entries),
+        Err(err) => {
+            eprintln!("Cache read failed, rebuilding: {}", err);
+            rebuild_cache(&root_dir, ignore_dirs)?;
+            load_cache_from_file(&cache_file_path)
+        }
+    }
+}
+
+fn default_cache_root() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
 fn load_cache_from_file(path: &Path) -> io::Result<Vec<CacheEntry>> {
@@ -137,6 +183,104 @@ fn load_cache_from_file(path: &Path) -> io::Result<Vec<CacheEntry>> {
         }
     }
     Ok(entries)
+}
+
+fn should_rebuild_cache(
+    root_dir: &Path,
+    ignore_dirs: &[String],
+    cache_ttl_seconds: Option<u64>,
+) -> bool {
+    if !get_cache_file().exists() {
+        return true;
+    }
+
+    let metadata = match read_cache_metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return true,
+    };
+
+    if metadata.version != CACHE_FORMAT_VERSION {
+        return true;
+    }
+
+    if metadata.root != root_dir.to_string_lossy() {
+        return true;
+    }
+
+    if metadata.ignore_dirs != normalized_ignore_dirs(ignore_dirs) {
+        return true;
+    }
+
+    if metadata.root_modified != modified_seconds(root_dir) {
+        return true;
+    }
+
+    let ttl = cache_ttl_seconds.unwrap_or(DEFAULT_CACHE_TTL_SECONDS);
+    ttl > 0 && now_seconds().saturating_sub(metadata.built_at) >= ttl
+}
+
+fn read_cache_metadata() -> io::Result<CacheMetadata> {
+    let content = fs::read_to_string(get_cache_meta_file())?;
+    serde_json::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn write_cache_metadata(root_dir: &Path, ignore_dirs: &[String]) -> io::Result<()> {
+    let metadata = CacheMetadata {
+        version: CACHE_FORMAT_VERSION,
+        root: root_dir.to_string_lossy().into_owned(),
+        ignore_dirs: normalized_ignore_dirs(ignore_dirs),
+        root_modified: modified_seconds(root_dir),
+        built_at: now_seconds(),
+    };
+
+    let metadata_path = get_cache_meta_file();
+    let metadata_tmp = temporary_path_for(&metadata_path);
+    let content = serde_json::to_string(&metadata)?;
+    fs::write(&metadata_tmp, content)?;
+    fs::rename(metadata_tmp, metadata_path)
+}
+
+fn temporary_path_for(path: &Path) -> PathBuf {
+    let mut temporary_path = path.to_path_buf();
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("tmp");
+    temporary_path.set_extension(format!(
+        "{}.{}.{}.tmp",
+        extension,
+        process::id(),
+        now_nanos()
+    ));
+    temporary_path
+}
+
+fn normalized_ignore_dirs(ignore_dirs: &[String]) -> Vec<String> {
+    let mut dirs = ignore_dirs.to_vec();
+    dirs.sort_unstable();
+    dirs.dedup();
+    dirs
+}
+
+fn modified_seconds(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(system_time_seconds)
+}
+
+fn now_seconds() -> u64 {
+    system_time_seconds(SystemTime::now()).unwrap_or(0)
+}
+
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
+fn system_time_seconds(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 fn determine_icon(path: &Path, is_dir: bool) -> String {

@@ -4,7 +4,9 @@ mod provider;
 
 use crate::core::PickerItem;
 use crate::mru::MruCache;
-use crate::provider::{Provider, desktop::DesktopProvider, files::FilesProvider, files::rebuild_cache};
+use crate::provider::{
+    desktop::DesktopProvider, files::rebuild_cache, files::FilesProvider, Provider,
+};
 
 use clap::{Parser, Subcommand};
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -21,7 +23,6 @@ const SOURCE_BASE_SCORE: i64 = 1000;
 
 /// Bonus range for shorter source names (shorter = higher priority).
 const SOURCE_NAME_LENGTH_BASE: i64 = 10;
-
 
 #[derive(Parser, Debug)]
 #[command(name = "apicker")]
@@ -73,6 +74,10 @@ struct Config {
     sources: Vec<SourceConfig>,
     #[serde(default)]
     ignore_dirs: Vec<String>,
+    #[serde(default)]
+    root_dir: Option<PathBuf>,
+    #[serde(default)]
+    cache_ttl_seconds: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -94,6 +99,8 @@ fn load_config() -> Config {
         return Config {
             sources: Vec::new(),
             ignore_dirs: Vec::new(),
+            root_dir: None,
+            cache_ttl_seconds: None,
         };
     }
 
@@ -105,6 +112,8 @@ fn load_config() -> Config {
                 Config {
                     sources: Vec::new(),
                     ignore_dirs: Vec::new(),
+                    root_dir: None,
+                    cache_ttl_seconds: None,
                 }
             }
         },
@@ -113,6 +122,8 @@ fn load_config() -> Config {
             Config {
                 sources: Vec::new(),
                 ignore_dirs: Vec::new(),
+                root_dir: None,
+                cache_ttl_seconds: None,
             }
         }
     }
@@ -163,7 +174,7 @@ fn main() {
             source,
             limit,
         } => {
-            let matcher = SkimMatcherV2::default();
+            let matcher = SkimMatcherV2::default().ignore_case();
             let mut results: Vec<PickerItem> = Vec::new();
             let mru = MruCache::load();
 
@@ -174,9 +185,13 @@ fn main() {
                 } else if source_name == "files" {
                     let files_provider = FilesProvider {
                         ignore_dirs: &config.ignore_dirs,
+                        root_dir: config.root_dir.as_deref(),
+                        cache_ttl_seconds: config.cache_ttl_seconds,
                     };
                     results.extend(files_provider.fetch(&query, &mru, &matcher));
-                } else if let Some(src_config) = config.sources.iter().find(|s| s.name == source_name) {
+                } else if let Some(src_config) =
+                    config.sources.iter().find(|s| s.name == source_name)
+                {
                     match run_source_script(&src_config.script) {
                         Ok(items) => {
                             for item in items {
@@ -228,7 +243,9 @@ fn main() {
                                 is_dir: false,
                                 is_submenu: true,
                                 target_source: Some(src.name.clone()),
-                                score: SOURCE_BASE_SCORE + (SOURCE_NAME_LENGTH_BASE - src.name.len() as i64) + boost,
+                                score: SOURCE_BASE_SCORE
+                                    + (SOURCE_NAME_LENGTH_BASE - src.name.len() as i64)
+                                    + boost,
                             });
                         }
                     }
@@ -239,6 +256,8 @@ fn main() {
 
                 let files_provider = FilesProvider {
                     ignore_dirs: &config.ignore_dirs,
+                    root_dir: config.root_dir.as_deref(),
+                    cache_ttl_seconds: config.cache_ttl_seconds,
                 };
                 results.extend(files_provider.fetch(search_query, &mru, &matcher));
             }
@@ -288,8 +307,9 @@ fn main() {
             }
         }
         Commands::RebuildCache { root } => {
-            let root_dir =
-                root.unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
+            let root_dir = root
+                .or_else(|| config.root_dir.clone())
+                .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
             println!("Scanning directory {:?} to rebuild cache...", root_dir);
             match rebuild_cache(&root_dir, &config.ignore_dirs) {
                 Ok(paths) => println!("Cache rebuilt successfully with {} items.", paths.len()),

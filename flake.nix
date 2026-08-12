@@ -45,6 +45,16 @@
             default = [ "node_modules" ".venv" "target" ];
             description = "Directories to ignore when caching files";
           };
+          root_dir = lib.mkOption {
+            type = lib.types.str;
+            default = config.home.homeDirectory;
+            description = "Root directory scanned for the file cache.";
+          };
+          cache_ttl_seconds = lib.mkOption {
+            type = lib.types.int;
+            default = 3600;
+            description = "Maximum age of the file cache before it is rebuilt. Set to 0 to disable TTL-based rebuilds.";
+          };
           settings = lib.mkOption {
             type = lib.types.attrs;
             default = {};
@@ -57,6 +67,8 @@
             let 
               mergedSettings = config.programs.apicker.settings // {
                 ignore_dirs = config.programs.apicker.ignore_dirs;
+                root_dir = config.programs.apicker.root_dir;
+                cache_ttl_seconds = config.programs.apicker.cache_ttl_seconds;
               };
               toTOML = (pkgs.formats.toml {}).generate "config.toml";
             in 

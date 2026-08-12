@@ -1,6 +1,13 @@
 # apicker configuration example
 # Copy this file to ~/.config/apicker/config.toml to customize.
 
+# Rebuild the file cache if it is older than this many seconds.
+# Set to 0 to only rebuild on metadata/config/root changes.
+cache_ttl_seconds = 3600
+
+# Directory scanned for the file cache.
+root_dir = "/home/your-user"
+
 [[sources]]
 name = "ssh"
 icon = "network-server"
