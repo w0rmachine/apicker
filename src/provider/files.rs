@@ -20,8 +20,11 @@ pub struct FilesProvider<'a> {
     pub ignore_dirs: &'a [String],
     pub root_dir: Option<&'a Path>,
     pub cache_ttl_seconds: Option<u64>,
+    pub glob: Option<&'a str>,
+    pub use_cache: bool,
 }
 
+#[derive(Clone)]
 struct CacheEntry {
     path: String,
     is_dir: bool,
@@ -40,10 +43,19 @@ impl<'a> Provider for FilesProvider<'a> {
     fn fetch(&self, query: &str, mru: &MruCache, matcher: &SkimMatcherV2) -> Vec<PickerItem> {
         let mut results = Vec::new();
 
-        match load_cache(self.root_dir, self.ignore_dirs, self.cache_ttl_seconds) {
+        match load_entries(
+            self.root_dir,
+            self.ignore_dirs,
+            self.cache_ttl_seconds,
+            self.use_cache,
+        ) {
             Ok(entries) => {
                 for entry in entries {
                     let path = Path::new(&entry.path);
+                    if !matches_glob_filter(path, self.glob) {
+                        continue;
+                    }
+
                     let file_name = path
                         .file_name()
                         .map(|f| f.to_string_lossy().into_owned())
@@ -106,8 +118,58 @@ pub fn rebuild_cache(root_dir: &Path, ignore_dirs: &[String]) -> io::Result<Vec<
     let cache_file_tmp = temporary_path_for(&cache_file_path);
     let mut file = File::create(&cache_file_tmp)?;
 
-    let mut paths = Vec::new();
-    for entry in WalkDir::new(root_dir)
+    let entries = scan_entries(root_dir, ignore_dirs);
+    for entry in &entries {
+        let type_flag = if entry.is_dir { 'D' } else { 'F' };
+        writeln!(file, "{}\t{}", entry.path, type_flag)?;
+    }
+    file.flush()?;
+    fs::rename(cache_file_tmp, cache_file_path)?;
+
+    write_cache_metadata(root_dir, ignore_dirs)?;
+    Ok(entries.into_iter().map(|entry| entry.path).collect())
+}
+
+fn load_entries(
+    root_dir: Option<&Path>,
+    ignore_dirs: &[String],
+    cache_ttl_seconds: Option<u64>,
+    use_cache: bool,
+) -> io::Result<Vec<CacheEntry>> {
+    let root_dir = root_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_cache_root);
+
+    if !use_cache {
+        return Ok(scan_entries(&root_dir, ignore_dirs));
+    }
+
+    load_cache(&root_dir, ignore_dirs, cache_ttl_seconds)
+}
+
+fn load_cache(
+    root_dir: &Path,
+    ignore_dirs: &[String],
+    cache_ttl_seconds: Option<u64>,
+) -> io::Result<Vec<CacheEntry>> {
+    let cache_file_path = get_cache_file();
+
+    if should_rebuild_cache(&root_dir, ignore_dirs, cache_ttl_seconds) {
+        rebuild_cache(root_dir, ignore_dirs)?;
+    }
+
+    match load_cache_from_file(&cache_file_path) {
+        Ok(entries) => Ok(entries),
+        Err(err) => {
+            eprintln!("Cache read failed, rebuilding: {}", err);
+            rebuild_cache(root_dir, ignore_dirs)?;
+            load_cache_from_file(&cache_file_path)
+        }
+    }
+}
+
+fn scan_entries(root_dir: &Path, ignore_dirs: &[String]) -> Vec<CacheEntry> {
+    WalkDir::new(root_dir)
         .into_iter()
         .filter_entry(|e| {
             let file_name = e.file_name().to_string_lossy();
@@ -122,42 +184,12 @@ pub fn rebuild_cache(root_dir: &Path, ignore_dirs: &[String]) -> io::Result<Vec<
             }
             true
         })
-        .filter_map(|e| e.ok())
-    {
-        let path_str = entry.path().to_string_lossy().into_owned();
-        let type_flag = if entry.file_type().is_dir() { 'D' } else { 'F' };
-        writeln!(file, "{}\t{}", path_str, type_flag)?;
-        paths.push(path_str);
-    }
-    file.flush()?;
-    fs::rename(cache_file_tmp, cache_file_path)?;
-
-    write_cache_metadata(root_dir, ignore_dirs)?;
-    Ok(paths)
-}
-
-fn load_cache(
-    root_dir: Option<&Path>,
-    ignore_dirs: &[String],
-    cache_ttl_seconds: Option<u64>,
-) -> io::Result<Vec<CacheEntry>> {
-    let cache_file_path = get_cache_file();
-    let root_dir = root_dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(default_cache_root);
-
-    if should_rebuild_cache(&root_dir, ignore_dirs, cache_ttl_seconds) {
-        rebuild_cache(&root_dir, ignore_dirs)?;
-    }
-
-    match load_cache_from_file(&cache_file_path) {
-        Ok(entries) => Ok(entries),
-        Err(err) => {
-            eprintln!("Cache read failed, rebuilding: {}", err);
-            rebuild_cache(&root_dir, ignore_dirs)?;
-            load_cache_from_file(&cache_file_path)
-        }
-    }
+        .filter_map(|entry| entry.ok())
+        .map(|entry| CacheEntry {
+            path: entry.path().to_string_lossy().into_owned(),
+            is_dir: entry.file_type().is_dir(),
+        })
+        .collect()
 }
 
 fn default_cache_root() -> PathBuf {
@@ -283,6 +315,54 @@ fn system_time_seconds(time: SystemTime) -> Option<u64> {
         .map(|duration| duration.as_secs())
 }
 
+fn matches_glob_filter(path: &Path, pattern: Option<&str>) -> bool {
+    let Some(pattern) = pattern else {
+        return true;
+    };
+
+    if pattern.contains('/') {
+        let path = path.to_string_lossy();
+        wildcard_match(pattern, &path)
+    } else {
+        path.file_name()
+            .map(|name| wildcard_match(pattern, &name.to_string_lossy()))
+            .unwrap_or(false)
+    }
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let text = text.as_bytes();
+    let (mut pattern_index, mut text_index) = (0, 0);
+    let mut star_index = None;
+    let mut star_text_index = 0;
+
+    while text_index < text.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == text[text_index])
+        {
+            pattern_index += 1;
+            text_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star_index = Some(pattern_index);
+            pattern_index += 1;
+            star_text_index = text_index;
+        } else if let Some(star) = star_index {
+            pattern_index = star + 1;
+            star_text_index += 1;
+            text_index = star_text_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+
+    pattern_index == pattern.len()
+}
+
 fn determine_icon(path: &Path, is_dir: bool) -> String {
     if is_dir {
         "folder".to_string()
@@ -300,5 +380,43 @@ fn determine_icon(path: &Path, is_dir: bool) -> String {
         }
     } else {
         "text-x-generic".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{matches_glob_filter, wildcard_match};
+    use std::path::Path;
+
+    #[test]
+    fn wildcard_supports_star_and_question_mark() {
+        assert!(wildcard_match("*.backup", "database.backup"));
+        assert!(wildcard_match("file-?.backup", "file-1.backup"));
+        assert!(!wildcard_match("file-?.backup", "file-12.backup"));
+        assert!(!wildcard_match("*.backup", "database.backup.old"));
+    }
+
+    #[test]
+    fn glob_without_slash_matches_file_name() {
+        assert!(matches_glob_filter(
+            Path::new("/tmp/project/database.backup"),
+            Some("*.backup")
+        ));
+        assert!(!matches_glob_filter(
+            Path::new("/tmp/project/database.txt"),
+            Some("*.backup")
+        ));
+    }
+
+    #[test]
+    fn glob_with_slash_matches_full_path() {
+        assert!(matches_glob_filter(
+            Path::new("/tmp/project/database.backup"),
+            Some("/tmp/*/*.backup")
+        ));
+        assert!(!matches_glob_filter(
+            Path::new("/var/project/database.backup"),
+            Some("/tmp/*/*.backup")
+        ));
     }
 }

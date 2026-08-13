@@ -85,6 +85,20 @@ Design a large popup window for deep file system traversal.
 * **The Call:** Your QML runs `apicker search --source files --query "<input>"`
 * **Previews:** In your QML `TextField`, listen for the `v` key (`Keys.onPressed`). If pressed, grab the `path` of the highlighted JSON result. If it's an image, render it in a QML `Image` component. If it's text, run `bat --color=always` and display the syntax-highlighted output in a side-panel.
 
+For exact file-picking patterns, pass a root and glob:
+
+```sh
+apicker search --source files --root / --glob '*.backup' --query ''
+```
+
+By default, file searches use the cached index for speed. Add `--no-cache` when you need a live filesystem scan:
+
+```sh
+apicker search --source files --root / --glob '*.backup' --no-cache
+```
+
+Glob patterns without `/` match file names anywhere below the root. Patterns containing `/` match the full path.
+
 ### 3. The Master Menu (`Super + M`)
 Bind `Super + M` to open a main launcher menu.
 * **The Call:** Your QML runs `apicker search --query ":"` (or an empty string).

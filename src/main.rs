@@ -44,6 +44,18 @@ enum Commands {
         #[arg(short, long)]
         source: Option<String>,
 
+        /// Root directory for file searches
+        #[arg(short, long)]
+        root: Option<PathBuf>,
+
+        /// Glob pattern for file searches (e.g. '*.backup')
+        #[arg(short = 'g', long)]
+        glob: Option<String>,
+
+        /// Scan the filesystem directly instead of using the cached file index
+        #[arg(long)]
+        no_cache: bool,
+
         /// Maximum number of results to return
         #[arg(short, long, default_value_t = 50)]
         limit: usize,
@@ -165,6 +177,9 @@ fn main() {
     let command = cli.command.unwrap_or(Commands::Search {
         query: String::new(),
         source: None,
+        root: None,
+        glob: None,
+        no_cache: false,
         limit: 50,
     });
 
@@ -172,11 +187,15 @@ fn main() {
         Commands::Search {
             query,
             source,
+            root,
+            glob,
+            no_cache,
             limit,
         } => {
             let matcher = SkimMatcherV2::default().ignore_case();
             let mut results: Vec<PickerItem> = Vec::new();
             let mru = MruCache::load();
+            let file_options_requested = root.is_some() || glob.is_some() || no_cache;
 
             if let Some(source_name) = source {
                 if source_name == "desktop" {
@@ -185,8 +204,10 @@ fn main() {
                 } else if source_name == "files" {
                     let files_provider = FilesProvider {
                         ignore_dirs: &config.ignore_dirs,
-                        root_dir: config.root_dir.as_deref(),
+                        root_dir: root.as_deref().or(config.root_dir.as_deref()),
                         cache_ttl_seconds: config.cache_ttl_seconds,
+                        glob: glob.as_deref(),
+                        use_cache: !no_cache,
                     };
                     results.extend(files_provider.fetch(&query, &mru, &matcher));
                 } else if let Some(src_config) =
@@ -227,7 +248,7 @@ fn main() {
                 let search_query = query.strip_prefix(':').unwrap_or(&query);
                 let show_sources = query.is_empty() || search_query.len() < query.len();
 
-                if show_sources {
+                if show_sources && !file_options_requested {
                     for src in &config.sources {
                         let matches = search_query.is_empty()
                             || matcher.fuzzy_match(&src.name, search_query).is_some();
@@ -251,13 +272,17 @@ fn main() {
                     }
                 }
 
-                let desktop_provider = DesktopProvider;
-                results.extend(desktop_provider.fetch(search_query, &mru, &matcher));
+                if !file_options_requested {
+                    let desktop_provider = DesktopProvider;
+                    results.extend(desktop_provider.fetch(search_query, &mru, &matcher));
+                }
 
                 let files_provider = FilesProvider {
                     ignore_dirs: &config.ignore_dirs,
-                    root_dir: config.root_dir.as_deref(),
+                    root_dir: root.as_deref().or(config.root_dir.as_deref()),
                     cache_ttl_seconds: config.cache_ttl_seconds,
+                    glob: glob.as_deref(),
+                    use_cache: !no_cache,
                 };
                 results.extend(files_provider.fetch(search_query, &mru, &matcher));
             }
