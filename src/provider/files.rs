@@ -11,6 +11,8 @@ use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
+use rayon::prelude::*;
+
 use crate::MRU_BOOST_FACTOR;
 
 const CACHE_FORMAT_VERSION: u32 = 2;
@@ -41,8 +43,6 @@ struct CacheMetadata {
 
 impl<'a> Provider for FilesProvider<'a> {
     fn fetch(&self, query: &str, mru: &MruCache, matcher: &SkimMatcherV2) -> Vec<PickerItem> {
-        let mut results = Vec::new();
-
         match load_entries(
             self.root_dir,
             self.ignore_dirs,
@@ -50,49 +50,53 @@ impl<'a> Provider for FilesProvider<'a> {
             self.use_cache,
         ) {
             Ok(entries) => {
-                for entry in entries {
-                    let path = Path::new(&entry.path);
-                    if !matches_glob_filter(path, self.glob) {
-                        continue;
-                    }
+                let is_empty_query = query.is_empty();
 
-                    let file_name = path
-                        .file_name()
-                        .map(|f| f.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| entry.path.clone());
+                entries
+                    .into_par_iter()
+                    .filter_map(|entry| {
+                        let path = Path::new(&entry.path);
+                        if !matches_glob_filter(path, self.glob) {
+                            return None;
+                        }
 
-                    let count = mru.get(&entry.path);
-                    let boost = (count as i64) * MRU_BOOST_FACTOR;
+                        let file_name = entry
+                            .path
+                            .rsplit_once('/')
+                            .map(|(_, f)| f)
+                            .unwrap_or(&entry.path);
 
-                    let (score, match_target) =
-                        if let Some(s) = matcher.fuzzy_match(&file_name, query) {
-                            (s + boost, file_name)
+                        let count = mru.get(&entry.path);
+                        let boost = (count as i64) * MRU_BOOST_FACTOR;
+
+                        let (score, match_target) = if is_empty_query {
+                            (boost, file_name.to_string())
+                        } else if let Some(s) = matcher.fuzzy_match(&file_name, query) {
+                            (s + boost, file_name.to_string())
                         } else if let Some(s) = matcher.fuzzy_match(&entry.path, query) {
                             (s - 10 + boost, entry.path.clone())
-                        } else if query.is_empty() {
-                            (boost, file_name)
                         } else {
-                            continue;
+                            return None;
                         };
 
-                    let icon = determine_icon(path, entry.is_dir);
-                    results.push(PickerItem {
-                        text: match_target,
-                        path: entry.path,
-                        icon,
-                        is_dir: entry.is_dir,
-                        is_submenu: false,
-                        target_source: None,
-                        score,
-                    });
-                }
+                        let icon = determine_icon(path, entry.is_dir);
+                        Some(PickerItem {
+                            text: match_target,
+                            path: entry.path,
+                            icon,
+                            is_dir: entry.is_dir,
+                            is_submenu: false,
+                            target_source: None,
+                            score,
+                        })
+                    })
+                    .collect()
             }
             Err(e) => {
                 eprintln!("Failed to load cache: {}", e);
+                Vec::new()
             }
         }
-
-        results
     }
 }
 
@@ -418,5 +422,20 @@ mod tests {
             Path::new("/var/project/database.backup"),
             Some("/tmp/*/*.backup")
         ));
+    }
+
+    #[test]
+    fn fast_filename_extraction() {
+        fn extract_filename<'a>(path: &'a str) -> &'a str {
+            path.rsplit_once('/').map(|(_, f)| f).unwrap_or(path)
+        }
+
+        assert_eq!(
+            extract_filename("/tmp/project/database.backup"),
+            "database.backup"
+        );
+        assert_eq!(extract_filename("database.backup"), "database.backup");
+        assert_eq!(extract_filename("/"), "");
+        assert_eq!(extract_filename("/home/user/.git"), ".git");
     }
 }

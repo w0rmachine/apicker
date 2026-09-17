@@ -56,6 +56,10 @@ enum Commands {
         #[arg(long)]
         no_cache: bool,
 
+        /// Do not use the default ignore list (.git, node_modules, etc.)
+        #[arg(long)]
+        no_default_ignores: bool,
+
         /// Maximum number of results to return
         #[arg(short, long, default_value_t = 50)]
         limit: usize,
@@ -75,9 +79,17 @@ enum Commands {
         /// Root directory to scan (default is user's home directory)
         #[arg(short, long)]
         root: Option<PathBuf>,
+
+        /// Do not use the default ignore list (.git, node_modules, etc.)
+        #[arg(long)]
+        no_default_ignores: bool,
     },
     /// List available custom source configurations
     ListScripts,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -86,6 +98,8 @@ struct Config {
     sources: Vec<SourceConfig>,
     #[serde(default)]
     ignore_dirs: Vec<String>,
+    #[serde(default = "default_true")]
+    use_default_ignores: bool,
     #[serde(default)]
     root_dir: Option<PathBuf>,
     #[serde(default)]
@@ -111,6 +125,7 @@ fn load_config() -> Config {
         return Config {
             sources: Vec::new(),
             ignore_dirs: Vec::new(),
+            use_default_ignores: true,
             root_dir: None,
             cache_ttl_seconds: None,
         };
@@ -124,6 +139,7 @@ fn load_config() -> Config {
                 Config {
                     sources: Vec::new(),
                     ignore_dirs: Vec::new(),
+                    use_default_ignores: true,
                     root_dir: None,
                     cache_ttl_seconds: None,
                 }
@@ -134,6 +150,7 @@ fn load_config() -> Config {
             Config {
                 sources: Vec::new(),
                 ignore_dirs: Vec::new(),
+                use_default_ignores: true,
                 root_dir: None,
                 cache_ttl_seconds: None,
             }
@@ -170,6 +187,20 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+const DEFAULT_IGNORES: &[&str] = &[
+    "node_modules",
+    "target",
+    ".git",
+    "build",
+    "dist",
+    ".cache",
+    "proc",
+    "sys",
+    "dev",
+    "run",
+    "tmp",
+];
+
 fn main() {
     let cli = Cli::parse();
     let config = load_config();
@@ -180,6 +211,7 @@ fn main() {
         root: None,
         glob: None,
         no_cache: false,
+        no_default_ignores: false,
         limit: 50,
     });
 
@@ -190,6 +222,7 @@ fn main() {
             root,
             glob,
             no_cache,
+            no_default_ignores,
             limit,
         } => {
             let matcher = SkimMatcherV2::default().ignore_case();
@@ -197,13 +230,22 @@ fn main() {
             let mru = MruCache::load();
             let file_options_requested = root.is_some() || glob.is_some() || no_cache;
 
+            let mut final_ignores = config.ignore_dirs.clone();
+            if config.use_default_ignores && !no_default_ignores {
+                for &dir in DEFAULT_IGNORES {
+                    if !final_ignores.iter().any(|d| d == dir) {
+                        final_ignores.push(dir.to_string());
+                    }
+                }
+            }
+
             if let Some(source_name) = source {
                 if source_name == "desktop" {
                     let desktop_provider = DesktopProvider;
                     results.extend(desktop_provider.fetch(&query, &mru, &matcher));
                 } else if source_name == "files" {
                     let files_provider = FilesProvider {
-                        ignore_dirs: &config.ignore_dirs,
+                        ignore_dirs: &final_ignores,
                         root_dir: root.as_deref().or(config.root_dir.as_deref()),
                         cache_ttl_seconds: config.cache_ttl_seconds,
                         glob: glob.as_deref(),
@@ -278,7 +320,7 @@ fn main() {
                 }
 
                 let files_provider = FilesProvider {
-                    ignore_dirs: &config.ignore_dirs,
+                    ignore_dirs: &final_ignores,
                     root_dir: root.as_deref().or(config.root_dir.as_deref()),
                     cache_ttl_seconds: config.cache_ttl_seconds,
                     glob: glob.as_deref(),
@@ -331,12 +373,23 @@ fn main() {
                 }
             }
         }
-        Commands::RebuildCache { root } => {
+        Commands::RebuildCache {
+            root,
+            no_default_ignores,
+        } => {
             let root_dir = root
                 .or_else(|| config.root_dir.clone())
                 .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
+            let mut final_ignores = config.ignore_dirs.clone();
+            if config.use_default_ignores && !no_default_ignores {
+                for &dir in DEFAULT_IGNORES {
+                    if !final_ignores.iter().any(|d| d == dir) {
+                        final_ignores.push(dir.to_string());
+                    }
+                }
+            }
             println!("Scanning directory {:?} to rebuild cache...", root_dir);
-            match rebuild_cache(&root_dir, &config.ignore_dirs) {
+            match rebuild_cache(&root_dir, &final_ignores) {
                 Ok(paths) => println!("Cache rebuilt successfully with {} items.", paths.len()),
                 Err(e) => eprintln!("Failed to rebuild cache: {}", e),
             }
