@@ -55,6 +55,11 @@
             default = 3600;
             description = "Maximum age of the file cache before it is rebuilt. Set to 0 to disable TTL-based rebuilds.";
           };
+          desktop_exclude = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [];
+            description = "Escape-hatch list of desktop-file IDs (e.g. \"foo.desktop\") to hide, matched case-insensitively. Normal visibility follows the XDG Desktop Entry specification.";
+          };
           settings = lib.mkOption {
             type = lib.types.attrs;
             default = {};
@@ -69,6 +74,7 @@
                 ignore_dirs = config.programs.apicker.ignore_dirs;
                 root_dir = config.programs.apicker.root_dir;
                 cache_ttl_seconds = config.programs.apicker.cache_ttl_seconds;
+                desktop_exclude = config.programs.apicker.desktop_exclude;
               };
               toTOML = (pkgs.formats.toml {}).generate "config.toml";
             in 

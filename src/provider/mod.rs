@@ -1,4 +1,5 @@
 pub mod desktop;
+pub mod desktop_spec;
 pub mod files;
 
 use crate::core::PickerItem;

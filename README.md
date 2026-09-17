@@ -9,10 +9,43 @@ Instead of dealing with the complexities of Wayland layer-shells and UI renderin
 ## 🚀 Key Features
 
 - **Blazing Fast File Search:** Uses asynchronous `WalkDir` caching and `fuzzy-matcher` to instantly find files.
-- **Native Desktop Apps:** Automatically discovers and parses `.desktop` entries from `/usr/share/applications` and `~/.local/share/applications`, extracting accurate icons and execution strings.
+- **Native Desktop Apps:** Automatically discovers and parses `.desktop` entries from `$XDG_DATA_HOME` and `$XDG_DATA_DIRS`, honoring the [Desktop Entry Specification](https://specifications.freedesktop.org/desktop-entry-spec/latest/): non-`Application` types, `Hidden`/`NoDisplay` entries, missing `TryExec` commands, and desktop-restricted (`OnlyShowIn`/`NotShowIn`) entries are excluded automatically.
 - **Intelligent MRU (Most Recently Used):** Automatically tracks the files and apps you open. The more you use something, the higher it gets boosted in the search results.
 - **Nix Native:** Exposes a declarative Home Manager module.
 - **Submenus & Custom Scripts:** Easily create submenus for clipboards, power options, or bookmarks using simple shell scripts.
+
+---
+
+## 🖥️ Desktop Entries (XDG compliant)
+
+The `desktop` source indexes `.desktop` files following the Desktop Entry
+Specification rather than scanning blindly:
+
+* **Directory precedence:** `$XDG_DATA_HOME/applications` (usually
+  `~/.local/share/applications`) wins over each entry in `$XDG_DATA_DIRS`, so a
+  Nix profile or `/usr/share` launcher is overridden by a user copy.
+* **De-duplication by desktop-file ID:** duplicates are resolved by ID
+  (`foo.desktop`, `kde-kate.desktop`, ...), not by whichever directory happened
+  to be scanned first. A higher-priority `Hidden=true`/`NoDisplay=true` entry
+  suppresses the lower-priority launcher completely.
+* **Visibility rules:** an entry is excluded when
+  `Type != Application`, `Hidden=true`, `NoDisplay=true`, `TryExec` names a
+  command that is not on `$PATH`, or `OnlyShowIn`/`NotShowIn` excludes the
+  active `$XDG_CURRENT_DESKTOP`. This hides portal/polkit/IBus/snap-agent and
+  GNOME service entries without any distro-specific blacklist.
+* **`Exec` field codes:** `Exec` is parsed per spec into an argv vector
+  (`%f`/`%F`/`%u`/`%U` are dropped, `%c` becomes the app name, `%k` the desktop
+  file path, `%i` expands to `--icon <name>`, `%%` is a literal `%`). Launches
+  are spawned directly, **never through `sh -c`**, so `Exec` values cannot
+  inject shell commands.
+
+If an entry is genuinely mislabeled upstream, add it to `desktop_exclude` in
+`~/.config/apicker/config.toml` as an escape hatch:
+
+```toml
+# Matches by desktop-file ID, basename, or basename without .desktop.
+desktop_exclude = ["some-broken-launcher.desktop"]
+```
 
 ---
 
@@ -36,6 +69,10 @@ programs.apicker = {
   
   # Optimize file searching by ignoring heavy directories
   ignore_dirs = [ ".venv" "node_modules" "target" ".git" ];
+
+  # Escape hatch only: hide a specific mislabeled launcher by desktop-file ID.
+  # Normal visibility follows the XDG Desktop Entry specification.
+  desktop_exclude = [ "some-broken-launcher.desktop" ];
   
   settings = {
     sources = [

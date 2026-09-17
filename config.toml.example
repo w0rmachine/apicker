@@ -8,6 +8,26 @@ cache_ttl_seconds = 3600
 # Directory scanned for the file cache.
 root_dir = "/home/your-user"
 
+# Whether to use the default ignore list (.git, node_modules, target, etc.)
+# Default: true
+use_default_ignores = true
+
+# Additional directories to ignore when scanning for files.
+ignore_dirs = ["node_modules", "target"]
+
+# Escape hatch for desktop launchers that are mislabeled upstream.
+#
+# Application visibility is decided by the XDG Desktop Entry specification:
+# entries are hidden when Type != Application, Hidden=true, NoDisplay=true,
+# TryExec names a missing command, or OnlyShowIn/NotShowIn excludes the active
+# $XDG_CURRENT_DESKTOP. You should not need this list for normal use.
+#
+# Entries may be named by desktop-file ID (e.g. "firefox.desktop",
+# "kde-kate.desktop"), by basename, or by basename without the .desktop suffix
+# (e.g. "firefox"). Matching is case-insensitive.
+desktop_exclude = ["example-url-handler.desktop"]
+
+
 [[sources]]
 name = "ssh"
 icon = "network-server"

@@ -88,6 +88,7 @@ impl<'a> Provider for FilesProvider<'a> {
                             is_submenu: false,
                             target_source: None,
                             score,
+                            exec_argv: None,
                         })
                     })
                     .collect()

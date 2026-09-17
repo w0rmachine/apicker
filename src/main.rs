@@ -5,7 +5,7 @@ mod provider;
 use crate::core::PickerItem;
 use crate::mru::MruCache;
 use crate::provider::{
-    desktop::DesktopProvider, files::rebuild_cache, files::FilesProvider, Provider,
+    desktop::DesktopProvider, desktop_spec, files::rebuild_cache, files::FilesProvider, Provider,
 };
 
 use clap::{Parser, Subcommand};
@@ -104,6 +104,14 @@ struct Config {
     root_dir: Option<PathBuf>,
     #[serde(default)]
     cache_ttl_seconds: Option<u64>,
+    /// Escape-hatch list of desktop launchers to hide, matched against the
+    /// desktop-file ID (e.g. `foo.desktop`) or file basename, case-insensitively.
+    ///
+    /// Visibility is normally decided by the XDG Desktop Entry specification
+    /// (`Type`, `Hidden`, `NoDisplay`, `TryExec`, `OnlyShowIn`/`NotShowIn`);
+    /// this list only exists for the rare launcher that is mislabeled upstream.
+    #[serde(default)]
+    desktop_exclude: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -128,6 +136,7 @@ fn load_config() -> Config {
             use_default_ignores: true,
             root_dir: None,
             cache_ttl_seconds: None,
+            desktop_exclude: Vec::new(),
         };
     }
 
@@ -142,6 +151,7 @@ fn load_config() -> Config {
                     use_default_ignores: true,
                     root_dir: None,
                     cache_ttl_seconds: None,
+                    desktop_exclude: Vec::new(),
                 }
             }
         },
@@ -153,6 +163,7 @@ fn load_config() -> Config {
                 use_default_ignores: true,
                 root_dir: None,
                 cache_ttl_seconds: None,
+                desktop_exclude: Vec::new(),
             }
         }
     }
@@ -185,6 +196,42 @@ fn run_source_script(script: &str) -> std::io::Result<Vec<String>> {
 fn shell_escape(s: &str) -> String {
     // Replace each ' with '\'' (end quote, escaped quote, start quote)
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Launch a desktop entry by desktop-file path.
+///
+/// The `.desktop` file is re-parsed and its `Exec` key expanded into an argv
+/// vector according to the Desktop Entry specification. The argv is spawned
+/// directly — never through `sh -c` — so `Exec` values cannot inject shell
+/// commands and field codes are handled per spec rather than by string hacks.
+fn launch_desktop_entry(desktop_path: &str) {
+    let path = PathBuf::from(desktop_path);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("Failed to read desktop entry '{}': {}", desktop_path, e);
+            return;
+        }
+    };
+
+    let entry = desktop_spec::parse_desktop_entry(&content);
+    let Some(argv) = desktop_spec::exec_to_argv(
+        entry.exec.as_deref().unwrap_or_default(),
+        &entry,
+        Some(path.as_path()),
+    ) else {
+        eprintln!(
+            "Desktop entry '{}' has no runnable Exec command.",
+            desktop_path
+        );
+        return;
+    };
+
+    let (program, args) = argv.split_first().expect("argv is non-empty");
+    match std::process::Command::new(program).args(args).spawn() {
+        Ok(_) => {}
+        Err(e) => eprintln!("Failed to launch '{}': {}", program, e),
+    }
 }
 
 const DEFAULT_IGNORES: &[&str] = &[
@@ -241,7 +288,10 @@ fn main() {
 
             if let Some(source_name) = source {
                 if source_name == "desktop" {
-                    let desktop_provider = DesktopProvider;
+                    let desktop_provider = DesktopProvider {
+                        exclude: &config.desktop_exclude,
+                        desktops: Vec::new(),
+                    };
                     results.extend(desktop_provider.fetch(&query, &mru, &matcher));
                 } else if source_name == "files" {
                     let files_provider = FilesProvider {
@@ -276,6 +326,7 @@ fn main() {
                                     is_submenu: false,
                                     target_source: None,
                                     score,
+                                    exec_argv: None,
                                 });
                             }
                         }
@@ -309,13 +360,17 @@ fn main() {
                                 score: SOURCE_BASE_SCORE
                                     + (SOURCE_NAME_LENGTH_BASE - src.name.len() as i64)
                                     + boost,
+                                exec_argv: None,
                             });
                         }
                     }
                 }
 
                 if !file_options_requested {
-                    let desktop_provider = DesktopProvider;
+                    let desktop_provider = DesktopProvider {
+                        exclude: &config.desktop_exclude,
+                        desktops: Vec::new(),
+                    };
                     results.extend(desktop_provider.fetch(search_query, &mru, &matcher));
                 }
 
@@ -351,7 +406,9 @@ fn main() {
             mru.increment(&item);
             mru.save();
 
-            if let Some(src_name) = source {
+            if source.as_deref() == Some("desktop") {
+                launch_desktop_entry(&item);
+            } else if let Some(src_name) = source {
                 if let Some(src_config) = config.sources.iter().find(|s| s.name == src_name) {
                     let escaped_item = shell_escape(&item);
                     let expanded_cmd = src_config.action.replace("{item}", &escaped_item);
