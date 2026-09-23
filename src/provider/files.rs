@@ -76,6 +76,13 @@ impl<'a> Provider for FilesProvider<'a> {
                         let boost = (count as i64) * MRU_BOOST_FACTOR;
 
                         let (score, match_target) = if is_empty_query {
+                            // An empty query is a "recent files" view. With no
+                            // glob there is no filter to apply, so an entry with
+                            // no MRU history is noise: it would just be an
+                            // arbitrary slice of the whole index.
+                            if boost == 0 && self.glob.is_none() {
+                                return None;
+                            }
                             (boost, file_name.to_string())
                         } else if let Some(s) = matcher.fuzzy_match(file_name, query) {
                             (s + boost, file_name.to_string())
@@ -469,6 +476,53 @@ mod tests {
             "ignore_dirs must win even with include_hidden: {:?}",
             names
         );
+    }
+
+    #[test]
+    fn empty_query_returns_only_recent_files() {
+        let dir = fixture_dir();
+        fs::write(dir.join("a.txt"), "").expect("write a.txt");
+        fs::write(dir.join("b.txt"), "").expect("write b.txt");
+
+        let no_ignores: Vec<String> = Vec::new();
+        let mut mru = MruCache::default();
+        let matcher = SkimMatcherV2::default();
+
+        let recent_only = FilesProvider {
+            ignore_dirs: &no_ignores,
+            root_dir: Some(&dir),
+            cache_ttl_seconds: None,
+            glob: None,
+            use_cache: false,
+            include_hidden: false,
+        };
+        assert!(recent_only.fetch("", &mru, &matcher).is_empty());
+
+        mru.increment(&dir.join("a.txt").to_string_lossy());
+        let items = recent_only.fetch("", &mru, &matcher);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].path.ends_with("a.txt"));
+
+        // A glob is an explicit file request: every match is listed even with
+        // an empty query and no MRU history.
+        let globbed = FilesProvider {
+            glob: Some("*.txt"),
+            ..recent_only
+        };
+        let mut names: Vec<String> = globbed
+            .fetch("", &mru, &matcher)
+            .iter()
+            .map(|item| item.path.clone())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names.len(),
+            2,
+            "glob must list all matches, got {:?}",
+            names
+        );
+        assert!(names[0].ends_with("a.txt"));
+        assert!(names[1].ends_with("b.txt"));
     }
 
     #[test]

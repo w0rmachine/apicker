@@ -138,6 +138,10 @@ apicker search --source files --root / --glob '*.backup' --no-cache
 
 Glob patterns without `/` match file names anywhere below the root. Patterns containing `/` match the full path.
 
+An empty query without `--glob` is a *recent files* view: only entries with MRU
+history are returned, so the picker does not surface an arbitrary slice of the
+whole index. Passing `--glob` lists every match regardless of recent use.
+
 File searches skip dotfiles and dot-directories by default. Pass `--hidden` (or set
 `include_hidden = true` in `config.toml`) to index them, so `~/.config/nvim/init.lua`
 or `.env` become findable:
