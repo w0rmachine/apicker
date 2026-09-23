@@ -15,7 +15,7 @@ use rayon::prelude::*;
 
 use crate::MRU_BOOST_FACTOR;
 
-const CACHE_FORMAT_VERSION: u32 = 2;
+const CACHE_FORMAT_VERSION: u32 = 3;
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 60 * 60;
 
 pub struct FilesProvider<'a> {
@@ -24,6 +24,10 @@ pub struct FilesProvider<'a> {
     pub cache_ttl_seconds: Option<u64>,
     pub glob: Option<&'a str>,
     pub use_cache: bool,
+    /// Include dotfiles/dot-directories in the index. Off by default because a
+    /// home-directory scan would otherwise be dominated by `~/.cache`,
+    /// `~/.local`, `~/.nix-profile`, ...
+    pub include_hidden: bool,
 }
 
 #[derive(Clone)]
@@ -37,6 +41,7 @@ struct CacheMetadata {
     version: u32,
     root: String,
     ignore_dirs: Vec<String>,
+    include_hidden: bool,
     root_modified: Option<u64>,
     built_at: u64,
 }
@@ -46,6 +51,7 @@ impl<'a> Provider for FilesProvider<'a> {
         match load_entries(
             self.root_dir,
             self.ignore_dirs,
+            self.include_hidden,
             self.cache_ttl_seconds,
             self.use_cache,
         ) {
@@ -115,14 +121,18 @@ fn get_cache_meta_file() -> PathBuf {
     get_cache_dir().join("paths.json")
 }
 
-pub fn rebuild_cache(root_dir: &Path, ignore_dirs: &[String]) -> io::Result<Vec<String>> {
+pub fn rebuild_cache(
+    root_dir: &Path,
+    ignore_dirs: &[String],
+    include_hidden: bool,
+) -> io::Result<Vec<String>> {
     let cache_dir = get_cache_dir();
     fs::create_dir_all(&cache_dir)?;
     let cache_file_path = get_cache_file();
     let cache_file_tmp = temporary_path_for(&cache_file_path);
     let mut file = File::create(&cache_file_tmp)?;
 
-    let entries = scan_entries(root_dir, ignore_dirs);
+    let entries = scan_entries(root_dir, ignore_dirs, include_hidden);
     for entry in &entries {
         let type_flag = if entry.is_dir { 'D' } else { 'F' };
         writeln!(file, "{}\t{}", entry.path, type_flag)?;
@@ -130,13 +140,14 @@ pub fn rebuild_cache(root_dir: &Path, ignore_dirs: &[String]) -> io::Result<Vec<
     file.flush()?;
     fs::rename(cache_file_tmp, cache_file_path)?;
 
-    write_cache_metadata(root_dir, ignore_dirs)?;
+    write_cache_metadata(root_dir, ignore_dirs, include_hidden)?;
     Ok(entries.into_iter().map(|entry| entry.path).collect())
 }
 
 fn load_entries(
     root_dir: Option<&Path>,
     ignore_dirs: &[String],
+    include_hidden: bool,
     cache_ttl_seconds: Option<u64>,
     use_cache: bool,
 ) -> io::Result<Vec<CacheEntry>> {
@@ -145,39 +156,45 @@ fn load_entries(
         .unwrap_or_else(default_cache_root);
 
     if !use_cache {
-        return Ok(scan_entries(&root_dir, ignore_dirs));
+        return Ok(scan_entries(&root_dir, ignore_dirs, include_hidden));
     }
 
-    load_cache(&root_dir, ignore_dirs, cache_ttl_seconds)
+    load_cache(&root_dir, ignore_dirs, include_hidden, cache_ttl_seconds)
 }
 
 fn load_cache(
     root_dir: &Path,
     ignore_dirs: &[String],
+    include_hidden: bool,
     cache_ttl_seconds: Option<u64>,
 ) -> io::Result<Vec<CacheEntry>> {
     let cache_file_path = get_cache_file();
 
-    if should_rebuild_cache(root_dir, ignore_dirs, cache_ttl_seconds) {
-        rebuild_cache(root_dir, ignore_dirs)?;
+    if should_rebuild_cache(root_dir, ignore_dirs, include_hidden, cache_ttl_seconds) {
+        rebuild_cache(root_dir, ignore_dirs, include_hidden)?;
     }
 
     match load_cache_from_file(&cache_file_path) {
         Ok(entries) => Ok(entries),
         Err(err) => {
             eprintln!("Cache read failed, rebuilding: {}", err);
-            rebuild_cache(root_dir, ignore_dirs)?;
+            rebuild_cache(root_dir, ignore_dirs, include_hidden)?;
             load_cache_from_file(&cache_file_path)
         }
     }
 }
 
-fn scan_entries(root_dir: &Path, ignore_dirs: &[String]) -> Vec<CacheEntry> {
+/// Collect the entries under `root_dir` into a flat index.
+///
+/// `ignore_dirs` is always honored; dotfiles are skipped unless
+/// `include_hidden` is set. `file_name != "."` keeps a `.` root directory from
+/// excluding itself.
+fn scan_entries(root_dir: &Path, ignore_dirs: &[String], include_hidden: bool) -> Vec<CacheEntry> {
     WalkDir::new(root_dir)
         .into_iter()
         .filter_entry(|e| {
             let file_name = e.file_name().to_string_lossy();
-            if file_name.starts_with('.') && file_name != "." {
+            if !include_hidden && file_name.starts_with('.') && file_name != "." {
                 return false;
             }
             if ignore_dirs
@@ -224,6 +241,7 @@ fn load_cache_from_file(path: &Path) -> io::Result<Vec<CacheEntry>> {
 fn should_rebuild_cache(
     root_dir: &Path,
     ignore_dirs: &[String],
+    include_hidden: bool,
     cache_ttl_seconds: Option<u64>,
 ) -> bool {
     if !get_cache_file().exists() {
@@ -247,6 +265,10 @@ fn should_rebuild_cache(
         return true;
     }
 
+    if metadata.include_hidden != include_hidden {
+        return true;
+    }
+
     if metadata.root_modified != modified_seconds(root_dir) {
         return true;
     }
@@ -260,11 +282,16 @@ fn read_cache_metadata() -> io::Result<CacheMetadata> {
     serde_json::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-fn write_cache_metadata(root_dir: &Path, ignore_dirs: &[String]) -> io::Result<()> {
+fn write_cache_metadata(
+    root_dir: &Path,
+    ignore_dirs: &[String],
+    include_hidden: bool,
+) -> io::Result<()> {
     let metadata = CacheMetadata {
         version: CACHE_FORMAT_VERSION,
         root: root_dir.to_string_lossy().into_owned(),
         ignore_dirs: normalized_ignore_dirs(ignore_dirs),
+        include_hidden,
         root_modified: modified_seconds(root_dir),
         built_at: now_seconds(),
     };
@@ -389,8 +416,60 @@ fn determine_icon(path: &Path, is_dir: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{matches_glob_filter, wildcard_match};
-    use std::path::Path;
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static FIXTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn fixture_dir() -> PathBuf {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("apicker-files-test-{}-{}", std::process::id(), n));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create fixture dir");
+        dir
+    }
+
+    fn file_names(entries: &[CacheEntry]) -> Vec<String> {
+        let mut names: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| entry.path.rsplit_once('/').map(|(_, f)| f.to_string()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn hidden_entries_are_opt_in() {
+        let dir = fixture_dir();
+        fs::write(dir.join("visible.txt"), "").expect("write visible");
+        fs::write(dir.join(".hidden.txt"), "").expect("write dotfile");
+        fs::create_dir_all(dir.join(".hidden_dir")).expect("create dir");
+
+        let default_names = file_names(&scan_entries(&dir, &[], false));
+        assert!(default_names.contains(&"visible.txt".to_string()));
+        assert!(!default_names.contains(&".hidden.txt".to_string()));
+        assert!(!default_names.contains(&".hidden_dir".to_string()));
+
+        let hidden_names = file_names(&scan_entries(&dir, &[], true));
+        assert!(hidden_names.contains(&"visible.txt".to_string()));
+        assert!(hidden_names.contains(&".hidden.txt".to_string()));
+        assert!(hidden_names.contains(&".hidden_dir".to_string()));
+    }
+
+    #[test]
+    fn ignore_dirs_still_apply_to_hidden_scans() {
+        let dir = fixture_dir();
+        fs::create_dir_all(dir.join(".cache")).expect("create dir");
+        fs::write(dir.join(".cache").join("junk"), "").expect("write");
+
+        let names = file_names(&scan_entries(&dir, &[".cache".to_string()], true));
+        assert!(
+            !names.iter().any(|name| name == ".cache"),
+            "ignore_dirs must win even with include_hidden: {:?}",
+            names
+        );
+    }
 
     #[test]
     fn wildcard_supports_star_and_question_mark() {

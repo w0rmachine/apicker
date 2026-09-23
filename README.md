@@ -138,6 +138,17 @@ apicker search --source files --root / --glob '*.backup' --no-cache
 
 Glob patterns without `/` match file names anywhere below the root. Patterns containing `/` match the full path.
 
+File searches skip dotfiles and dot-directories by default. Pass `--hidden` (or set
+`include_hidden = true` in `config.toml`) to index them, so `~/.config/nvim/init.lua`
+or `.env` become findable:
+
+```sh
+apicker search --source files --root ~ --hidden --query env
+```
+
+The flag also applies to `apicker rebuild-cache --hidden`; a cache built with hidden
+files is not reused for a normal search and vice-versa.
+
 ### 3. The Master Menu (`Super + M`)
 Bind `Super + M` to open a main launcher menu.
 * **The Call:** Your QML runs `apicker search --query ":"` (or an empty string).

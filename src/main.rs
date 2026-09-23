@@ -65,6 +65,10 @@ enum Commands {
         #[arg(long)]
         no_default_ignores: bool,
 
+        /// Include dotfiles and dot-directories in file searches
+        #[arg(long)]
+        hidden: bool,
+
         /// Maximum number of results to return
         #[arg(short, long, default_value_t = 50)]
         limit: usize,
@@ -88,6 +92,10 @@ enum Commands {
         /// Do not use the default ignore list (.git, node_modules, etc.)
         #[arg(long)]
         no_default_ignores: bool,
+
+        /// Index dotfiles and dot-directories as well
+        #[arg(long)]
+        hidden: bool,
     },
     /// List available custom source configurations
     ListScripts,
@@ -102,6 +110,7 @@ impl Default for Commands {
             glob: None,
             no_cache: false,
             no_default_ignores: false,
+            hidden: false,
             limit: 50,
         }
     }
@@ -123,6 +132,11 @@ struct Config {
     root_dir: Option<PathBuf>,
     #[serde(default)]
     cache_ttl_seconds: Option<u64>,
+    /// Whether file searches include dotfiles/dot-directories by default.
+    /// `--hidden` on the command line turns it on for a single invocation.
+    #[serde(default)]
+    include_hidden: bool,
+
     /// Escape-hatch list of desktop launchers to hide, matched against the
     /// desktop-file ID (e.g. `foo.desktop`) or file basename, case-insensitively.
     ///
@@ -141,6 +155,7 @@ impl Default for Config {
             use_default_ignores: true,
             root_dir: None,
             cache_ttl_seconds: None,
+            include_hidden: false,
             desktop_exclude: Vec::new(),
         }
     }
@@ -300,12 +315,14 @@ fn main() {
             glob,
             no_cache,
             no_default_ignores,
+            hidden,
             limit,
         } => {
             let matcher = SkimMatcherV2::default().ignore_case();
             let mut results: Vec<PickerItem> = Vec::new();
             let mru = MruCache::load();
             let file_options_requested = root.is_some() || glob.is_some() || no_cache;
+            let include_hidden = hidden || config.include_hidden;
 
             let final_ignores = resolve_ignores(&config, no_default_ignores);
 
@@ -323,6 +340,7 @@ fn main() {
                         cache_ttl_seconds: config.cache_ttl_seconds,
                         glob: glob.as_deref(),
                         use_cache: !no_cache,
+                        include_hidden,
                     };
                     results.extend(files_provider.fetch(&query, &mru, &matcher));
                 } else if let Some(src_config) =
@@ -401,6 +419,7 @@ fn main() {
                     cache_ttl_seconds: config.cache_ttl_seconds,
                     glob: glob.as_deref(),
                     use_cache: !no_cache,
+                    include_hidden,
                 };
                 results.extend(files_provider.fetch(search_query, &mru, &matcher));
             }
@@ -465,13 +484,15 @@ fn main() {
         Commands::RebuildCache {
             root,
             no_default_ignores,
+            hidden,
         } => {
             let root_dir = root
                 .or_else(|| config.root_dir.clone())
                 .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
             let final_ignores = resolve_ignores(&config, no_default_ignores);
+            let include_hidden = hidden || config.include_hidden;
             println!("Scanning directory {:?} to rebuild cache...", root_dir);
-            match rebuild_cache(&root_dir, &final_ignores) {
+            match rebuild_cache(&root_dir, &final_ignores, include_hidden) {
                 Ok(paths) => println!("Cache rebuilt successfully with {} items.", paths.len()),
                 Err(e) => eprintln!("Failed to rebuild cache: {}", e),
             }

@@ -12,6 +12,11 @@ root_dir = "/home/your-user"
 # Default: true
 use_default_ignores = true
 
+# Whether file searches include dotfiles and dot-directories by default.
+# The `--hidden` flag turns this on for a single invocation.
+# Default: false
+include_hidden = false
+
 # Additional directories to ignore when scanning for files.
 ignore_dirs = ["node_modules", "target"]
 
