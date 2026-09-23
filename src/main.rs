@@ -17,8 +17,10 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 /// MRU boost multiplier — each recent-use count adds this much to the score.
 pub const MRU_BOOST_FACTOR: i64 = 50;
@@ -28,6 +30,9 @@ const SOURCE_BASE_SCORE: i64 = 1000;
 
 /// Bonus range for shorter source names (shorter = higher priority).
 const SOURCE_NAME_LENGTH_BASE: i64 = 10;
+
+/// How long a custom source script may run before the picker gives up on it.
+const SOURCE_SCRIPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser, Debug)]
 #[command(name = "apicker")]
@@ -195,20 +200,68 @@ fn load_config() -> Config {
     }
 }
 
-fn run_source_script(script: &str) -> std::io::Result<Vec<String>> {
-    let output = std::process::Command::new("sh")
+/// Run a custom source script and return its non-empty stdout lines.
+///
+/// Bounded by `timeout`: a hung script must not block the whole search, because
+/// the QML frontend spawns one `apicker search` per keystroke.
+///
+/// ponytail: only the direct child is killed, so a backgrounded grandchild is
+/// left running. Killing the process group (setsid) is the upgrade path if a
+/// script ever daemonizes and outlives the picker.
+fn run_source_script(script: &str, timeout: Duration) -> std::io::Result<Vec<String>> {
+    let start = Instant::now();
+
+    let mut child = std::process::Command::new("sh")
         .arg("-c")
         .arg(script)
-        .output()?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
 
-    if !output.status.success() {
+    // Drain stdout on a helper thread: a chatty script would otherwise block
+    // once the pipe buffer fills while the main thread polls for exit.
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let _reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(result);
+    });
+
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Script timed out after {:?}", timeout),
+                ));
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+
+    if !status.success() {
         return Err(std::io::Error::other(format!(
             "Script failed with exit code: {:?}",
-            output.status.code()
+            status.code()
         )));
     }
 
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    // Bounded receive rather than `join()`: if `sh` backgrounded a child that
+    // still holds the write end of the pipe, joining would hang forever.
+    let remaining = timeout.saturating_sub(start.elapsed());
+    let stdout_bytes = receiver.recv_timeout(remaining).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("Script held stdout open past {:?}", timeout),
+        )
+    })??;
+
+    let stdout_str = String::from_utf8_lossy(&stdout_bytes);
     let items = stdout_str
         .lines()
         .map(|line| line.trim().to_string())
@@ -346,7 +399,7 @@ fn main() {
                 } else if let Some(src_config) =
                     config.sources.iter().find(|s| s.name == source_name)
                 {
-                    match run_source_script(&src_config.script) {
+                    match run_source_script(&src_config.script, SOURCE_SCRIPT_TIMEOUT) {
                         Ok(items) => {
                             for item in items {
                                 let count = mru.get(&item);
@@ -501,5 +554,31 @@ fn main() {
             Ok(json) => println!("{}", json),
             Err(e) => eprintln!("Error serializing scripts: {}", e),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_source_script;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn source_script_returns_trimmed_nonempty_lines() {
+        let lines = run_source_script("printf 'a\\nb\\n\\n'", Duration::from_secs(5))
+            .expect("script should succeed");
+        assert_eq!(lines, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn source_script_times_out_without_hanging() {
+        let started = Instant::now();
+        let err = run_source_script("sleep 5", Duration::from_millis(200))
+            .expect_err("a sleeping script must not succeed");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timeout took {:?}",
+            started.elapsed()
+        );
     }
 }

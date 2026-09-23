@@ -36,6 +36,7 @@ desktop_exclude = ["example-url-handler.desktop"]
 # Action scripts are run with `sh -c`. Every `{item}` placeholder is
 # substituted as a single-quoted shell literal, so use it bare:
 # `echo {item}` is correct, `echo "{item}"` passes the quotes to the program.
+# Source scripts that do not finish within 10 seconds are killed.
 
 [[sources]]
 name = "ssh"
