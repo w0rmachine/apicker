@@ -36,6 +36,7 @@ const SOURCE_SCRIPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser, Debug)]
 #[command(name = "apicker")]
+#[command(version)]
 #[command(about = "A fast, scriptable file picker backend in Rust", long_about = None)]
 struct Cli {
     #[command(subcommand)]
