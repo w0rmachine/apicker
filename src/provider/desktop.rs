@@ -233,6 +233,21 @@ fn load_entry(path: &Path) -> Option<DesktopEntry> {
     Some(desktop_spec::parse_desktop_entry(&content))
 }
 
+/// Stable MRU key for a desktop launcher: its resolved argv.
+///
+/// Keying on the argv rather than the raw `Exec` string keeps entries stable
+/// across field-code edits, and keying on it rather than the `.desktop` path
+/// survives store-path churn on Nix. `build_item` and the execute path must
+/// use the same key or scores never accumulate.
+///
+/// ponytail: reads the file on every desktop launch; fine at CLI cadence.
+pub fn desktop_mru_key(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let entry = desktop_spec::parse_desktop_entry(&content);
+    let argv = desktop_spec::exec_to_argv(entry.exec.as_deref()?, &entry, Some(path))?;
+    Some(argv.join(" "))
+}
+
 /// Turn a visible entry into a [`PickerItem`], scoring it against `query`.
 fn build_item(
     entry: &DesktopEntry,
@@ -250,8 +265,7 @@ fn build_item(
     let argv = desktop_spec::exec_to_argv(exec, entry, Some(path))?;
     let program = argv.first().cloned().unwrap_or_default();
 
-    // MRU keys stay stable across field-code changes by keying on the resolved
-    // argv rather than the raw `Exec` string.
+    // Must match `desktop_mru_key`, which the execute path writes.
     let mru_key = argv.join(" ");
     let boost = (mru.get(&mru_key) as i64) * MRU_BOOST_FACTOR;
 
@@ -281,7 +295,6 @@ fn build_item(
         is_submenu: false,
         target_source: None,
         score,
-        exec_argv: Some(argv),
     })
 }
 
@@ -539,12 +552,42 @@ mod tests {
 
         let items = index(std::slice::from_ref(&dir), &[], &[]);
         assert_eq!(items.len(), 1);
-        let argv = items[0].exec_argv.as_ref().unwrap();
-        assert_eq!(
-            argv,
-            &vec!["/usr/bin/app".to_string(), "--flag".to_string()]
-        );
         // `path` is the re-resolvable desktop-file path, not a shell command.
         assert!(items[0].path.ends_with("app.desktop"));
+        // The execute path derives its MRU key from the same parse.
+        assert_eq!(
+            desktop_mru_key(&dir.join("app.desktop")).as_deref(),
+            Some("/usr/bin/app --flag")
+        );
+    }
+
+    #[test]
+    fn mru_boost_uses_the_same_key_the_execute_path_writes() {
+        let dir = fixture_dir();
+        write_desktop(
+            &dir,
+            "app.desktop",
+            "[Desktop Entry]\nType=Application\nName=App\nExec=/usr/bin/app --flag\n",
+        );
+
+        let mut mru = MruCache::default();
+        mru.increment(&desktop_mru_key(&dir.join("app.desktop")).unwrap());
+
+        let provider = DesktopProvider {
+            exclude: &[],
+            desktops: Vec::new(),
+        };
+        let items = provider.collect(
+            std::slice::from_ref(&dir),
+            "App",
+            &mru,
+            &SkimMatcherV2::default(),
+        );
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0].score >= MRU_BOOST_FACTOR,
+            "expected MRU boost, got score {}",
+            items[0].score
+        );
     }
 }

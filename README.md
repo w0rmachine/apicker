@@ -85,11 +85,13 @@ programs.apicker = {
           echo "Reboot"
           echo "Logout"
         '';
+        # `{item}` is substituted as a single-quoted shell literal. Use it bare;
+        # wrapping it in quotes makes those quotes part of the value.
         action = ''
-          case "{item}" in
-            "Shutdown") systemctl poweroff ;;
-            "Reboot") systemctl reboot ;;
-            "Logout") hyprctl dispatch exit ;;
+          case {item} in
+            Shutdown) systemctl poweroff ;;
+            Reboot) systemctl reboot ;;
+            Logout) hyprctl dispatch exit ;;
           esac
         '';
       },

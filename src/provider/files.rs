@@ -71,7 +71,7 @@ impl<'a> Provider for FilesProvider<'a> {
 
                         let (score, match_target) = if is_empty_query {
                             (boost, file_name.to_string())
-                        } else if let Some(s) = matcher.fuzzy_match(&file_name, query) {
+                        } else if let Some(s) = matcher.fuzzy_match(file_name, query) {
                             (s + boost, file_name.to_string())
                         } else if let Some(s) = matcher.fuzzy_match(&entry.path, query) {
                             (s - 10 + boost, entry.path.clone())
@@ -88,7 +88,6 @@ impl<'a> Provider for FilesProvider<'a> {
                             is_submenu: false,
                             target_source: None,
                             score,
-                            exec_argv: None,
                         })
                     })
                     .collect()
@@ -159,7 +158,7 @@ fn load_cache(
 ) -> io::Result<Vec<CacheEntry>> {
     let cache_file_path = get_cache_file();
 
-    if should_rebuild_cache(&root_dir, ignore_dirs, cache_ttl_seconds) {
+    if should_rebuild_cache(root_dir, ignore_dirs, cache_ttl_seconds) {
         rebuild_cache(root_dir, ignore_dirs)?;
     }
 
@@ -427,7 +426,7 @@ mod tests {
 
     #[test]
     fn fast_filename_extraction() {
-        fn extract_filename<'a>(path: &'a str) -> &'a str {
+        fn extract_filename(path: &str) -> &str {
             path.rsplit_once('/').map(|(_, f)| f).unwrap_or(path)
         }
 

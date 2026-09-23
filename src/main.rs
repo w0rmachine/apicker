@@ -5,7 +5,11 @@ mod provider;
 use crate::core::PickerItem;
 use crate::mru::MruCache;
 use crate::provider::{
-    desktop::DesktopProvider, desktop_spec, files::rebuild_cache, files::FilesProvider, Provider,
+    desktop::{self, DesktopProvider},
+    desktop_spec,
+    files::rebuild_cache,
+    files::FilesProvider,
+    Provider,
 };
 
 use clap::{Parser, Subcommand};
@@ -13,7 +17,8 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 /// MRU boost multiplier — each recent-use count adds this much to the score.
 pub const MRU_BOOST_FACTOR: i64 = 50;
@@ -88,6 +93,20 @@ enum Commands {
     ListScripts,
 }
 
+impl Default for Commands {
+    fn default() -> Self {
+        Self::Search {
+            query: String::new(),
+            source: None,
+            root: None,
+            glob: None,
+            no_cache: false,
+            no_default_ignores: false,
+            limit: 50,
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -114,6 +133,19 @@ struct Config {
     desktop_exclude: Vec<String>,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            ignore_dirs: Vec::new(),
+            use_default_ignores: true,
+            root_dir: None,
+            cache_ttl_seconds: None,
+            desktop_exclude: Vec::new(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct SourceConfig {
     name: String,
@@ -130,14 +162,7 @@ fn load_config() -> Config {
 
     let config_path = config_dir.join("config.toml");
     if !config_path.exists() {
-        return Config {
-            sources: Vec::new(),
-            ignore_dirs: Vec::new(),
-            use_default_ignores: true,
-            root_dir: None,
-            cache_ttl_seconds: None,
-            desktop_exclude: Vec::new(),
-        };
+        return Config::default();
     }
 
     match fs::read_to_string(&config_path) {
@@ -145,26 +170,12 @@ fn load_config() -> Config {
             Ok(config) => config,
             Err(e) => {
                 eprintln!("Error parsing config.toml: {}", e);
-                Config {
-                    sources: Vec::new(),
-                    ignore_dirs: Vec::new(),
-                    use_default_ignores: true,
-                    root_dir: None,
-                    cache_ttl_seconds: None,
-                    desktop_exclude: Vec::new(),
-                }
+                Config::default()
             }
         },
         Err(e) => {
             eprintln!("Error reading config.toml: {}", e);
-            Config {
-                sources: Vec::new(),
-                ignore_dirs: Vec::new(),
-                use_default_ignores: true,
-                root_dir: None,
-                cache_ttl_seconds: None,
-                desktop_exclude: Vec::new(),
-            }
+            Config::default()
         }
     }
 }
@@ -205,6 +216,7 @@ fn shell_escape(s: &str) -> String {
 /// directly — never through `sh -c` — so `Exec` values cannot inject shell
 /// commands and field codes are handled per spec rather than by string hacks.
 fn launch_desktop_entry(desktop_path: &str) {
+    // ponytail: re-reads the entry at launch time; cache if launch latency ever matters.
     let path = PathBuf::from(desktop_path);
     let content = match fs::read_to_string(&path) {
         Ok(content) => content,
@@ -228,10 +240,21 @@ fn launch_desktop_entry(desktop_path: &str) {
     };
 
     let (program, args) = argv.split_first().expect("argv is non-empty");
-    match std::process::Command::new(program).args(args).spawn() {
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    match spawn_detached(&mut command) {
         Ok(_) => {}
         Err(e) => eprintln!("Failed to launch '{}': {}", program, e),
     }
+}
+
+/// Start a launcher without inheriting apicker's stdout/stderr.
+///
+/// apicker exits immediately, but a chatty child would otherwise keep the
+/// caller's pipe open and block once its buffer fills. stdin is inherited so
+/// actions that prompt (e.g. `sudo`) still work from a terminal.
+fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    command.stdout(Stdio::null()).stderr(Stdio::null()).spawn()
 }
 
 const DEFAULT_IGNORES: &[&str] = &[
@@ -248,19 +271,26 @@ const DEFAULT_IGNORES: &[&str] = &[
     "tmp",
 ];
 
+/// Merge configured ignore dirs with the built-in list, keeping order and
+/// dropping duplicates. Used by both `search` and `rebuild-cache` so the two
+/// always agree on what the cache contains.
+fn resolve_ignores(config: &Config, no_default_ignores: bool) -> Vec<String> {
+    let mut ignores = config.ignore_dirs.clone();
+    if config.use_default_ignores && !no_default_ignores {
+        for &dir in DEFAULT_IGNORES {
+            if !ignores.iter().any(|d| d == dir) {
+                ignores.push(dir.to_string());
+            }
+        }
+    }
+    ignores
+}
+
 fn main() {
     let cli = Cli::parse();
     let config = load_config();
 
-    let command = cli.command.unwrap_or(Commands::Search {
-        query: String::new(),
-        source: None,
-        root: None,
-        glob: None,
-        no_cache: false,
-        no_default_ignores: false,
-        limit: 50,
-    });
+    let command = cli.command.unwrap_or_default();
 
     match command {
         Commands::Search {
@@ -277,14 +307,7 @@ fn main() {
             let mru = MruCache::load();
             let file_options_requested = root.is_some() || glob.is_some() || no_cache;
 
-            let mut final_ignores = config.ignore_dirs.clone();
-            if config.use_default_ignores && !no_default_ignores {
-                for &dir in DEFAULT_IGNORES {
-                    if !final_ignores.iter().any(|d| d == dir) {
-                        final_ignores.push(dir.to_string());
-                    }
-                }
-            }
+            let final_ignores = resolve_ignores(&config, no_default_ignores);
 
             if let Some(source_name) = source {
                 if source_name == "desktop" {
@@ -326,7 +349,6 @@ fn main() {
                                     is_submenu: false,
                                     target_source: None,
                                     score,
-                                    exec_argv: None,
                                 });
                             }
                         }
@@ -360,7 +382,6 @@ fn main() {
                                 score: SOURCE_BASE_SCORE
                                     + (SOURCE_NAME_LENGTH_BASE - src.name.len() as i64)
                                     + boost,
-                                exec_argv: None,
                             });
                         }
                     }
@@ -384,26 +405,37 @@ fn main() {
                 results.extend(files_provider.fetch(search_query, &mru, &matcher));
             }
 
-            results.sort_by(|a, b| {
+            let by_rank = |a: &PickerItem, b: &PickerItem| {
                 b.score
                     .cmp(&a.score)
                     .then_with(|| a.path.len().cmp(&b.path.len()))
-            });
-
-            let results_slice = if results.len() > limit {
-                &results[..limit]
-            } else {
-                &results[..]
             };
 
-            match serde_json::to_string(results_slice) {
+            // Partition down to the top `limit` before sorting: a home-dir
+            // scan can yield hundreds of thousands of items per keystroke.
+            if results.len() > limit {
+                results.select_nth_unstable_by(limit, by_rank);
+                results.truncate(limit);
+            }
+            results.sort_by(by_rank);
+
+            match serde_json::to_string(&results) {
                 Ok(json) => println!("{}", json),
                 Err(e) => eprintln!("Error serializing search results: {}", e),
             }
         }
         Commands::Execute { source, item } => {
+            // Desktop entries are scored against their resolved argv (see
+            // `desktop::build_item`), so the MRU write must use the same key
+            // instead of the desktop-file path.
+            let mru_key = match source.as_deref() {
+                Some("desktop") => desktop::desktop_mru_key(Path::new(&item)),
+                _ => None,
+            }
+            .unwrap_or_else(|| item.clone());
+
             let mut mru = MruCache::load();
-            mru.increment(&item);
+            mru.increment(&mru_key);
             mru.save();
 
             if source.as_deref() == Some("desktop") {
@@ -412,11 +444,9 @@ fn main() {
                 if let Some(src_config) = config.sources.iter().find(|s| s.name == src_name) {
                     let escaped_item = shell_escape(&item);
                     let expanded_cmd = src_config.action.replace("{item}", &escaped_item);
-                    match std::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(&expanded_cmd)
-                        .spawn()
-                    {
+                    let mut command = std::process::Command::new("sh");
+                    command.arg("-c").arg(&expanded_cmd);
+                    match spawn_detached(&mut command) {
                         Ok(_) => {}
                         Err(e) => eprintln!("Failed to spawn action process: {}", e),
                     }
@@ -424,7 +454,9 @@ fn main() {
                     eprintln!("Source '{}' not found in config.", src_name);
                 }
             } else {
-                match std::process::Command::new("xdg-open").arg(&item).spawn() {
+                let mut command = std::process::Command::new("xdg-open");
+                command.arg(&item);
+                match spawn_detached(&mut command) {
                     Ok(_) => {}
                     Err(e) => eprintln!("Failed to run xdg-open for '{}': {}", item, e),
                 }
@@ -437,14 +469,7 @@ fn main() {
             let root_dir = root
                 .or_else(|| config.root_dir.clone())
                 .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
-            let mut final_ignores = config.ignore_dirs.clone();
-            if config.use_default_ignores && !no_default_ignores {
-                for &dir in DEFAULT_IGNORES {
-                    if !final_ignores.iter().any(|d| d == dir) {
-                        final_ignores.push(dir.to_string());
-                    }
-                }
-            }
+            let final_ignores = resolve_ignores(&config, no_default_ignores);
             println!("Scanning directory {:?} to rebuild cache...", root_dir);
             match rebuild_cache(&root_dir, &final_ignores) {
                 Ok(paths) => println!("Cache rebuilt successfully with {} items.", paths.len()),

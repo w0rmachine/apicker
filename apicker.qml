@@ -1,5 +1,6 @@
 import Quickshell
 import Quickshell.Io
+import Quickshell.Widgets
 import QtQuick
 import QtQuick.Controls
 
@@ -11,14 +12,27 @@ PopupWindow {
     // anchor.rect.x: mainBar.width / 2 - width / 2
     // anchor.rect.y: mainBar.height
     
-    width: 500
-    height: 550
+    implicitWidth: 500
+    implicitHeight: 550
     visible: false // Hidden by default, toggled via IPC
     
     // Keep keyboard focus grabbed when visible
     grabFocus: visible
     
     property string currentSource: ""
+
+    // Re-run the query, cancelling any in-flight search.
+    function scheduleSearch() {
+        searchDebounce.restart();
+    }
+
+    // Debounce keystrokes so holding a key doesn't spawn one apicker per tick.
+    Timer {
+        id: searchDebounce
+        interval: 60
+        repeat: false
+        onTriggered: searchProcess.restartSearch()
+    }
     
     // IPC Interface to allow launching or toggling via shell keybindings
     // Run command: `qs ipc call apicker toggle`
@@ -31,7 +45,7 @@ PopupWindow {
                 searchInput.text = "";
                 pickerPopup.currentSource = "";
                 searchInput.forceActiveFocus();
-                searchProcess.restartSearch();
+                pickerPopup.scheduleSearch();
             }
         }
         
@@ -40,7 +54,7 @@ PopupWindow {
             searchInput.text = "";
             pickerPopup.currentSource = "";
             searchInput.forceActiveFocus();
-            searchProcess.restartSearch();
+            pickerPopup.scheduleSearch();
         }
         
         function hide() {
@@ -119,7 +133,7 @@ PopupWindow {
                 
                 onTextChanged: {
                     searchProcess.query = text;
-                    searchProcess.restartSearch();
+                    pickerPopup.scheduleSearch();
                 }
                 
                 // Keyboard navigation controls
@@ -136,7 +150,7 @@ PopupWindow {
                     } else if (event.key === Qt.Key_Backspace && searchInput.text === "" && pickerPopup.currentSource !== "") {
                         // Exit current submenu back to root files menu when backspace is pressed on empty input
                         pickerPopup.currentSource = "";
-                        searchProcess.restartSearch();
+                        pickerPopup.scheduleSearch();
                         event.accepted = true;
                     } else if (event.key === Qt.Key_Enter || event.key === Qt.Key_Return) {
                         if (resultsList.currentItem) {
@@ -164,7 +178,7 @@ PopupWindow {
                         if (model.is_submenu) {
                             pickerPopup.currentSource = model.target_source;
                             searchInput.text = "";
-                            searchProcess.restartSearch();
+                            pickerPopup.scheduleSearch();
                         } else {
                             actionProcess.runAction(model.path, pickerPopup.currentSource);
                             pickerPopup.visible = false;
@@ -186,7 +200,6 @@ PopupWindow {
                             source: "image://icon/" + model.icon
                             width: 18
                             height: 18
-                            color: parent.parent.highlighted ? "#c6a0f6" : "#b8c0e0"
                         }
                         
                         Text {
@@ -216,9 +229,18 @@ PopupWindow {
             }
             return args;
         }
+
+        // Collect to completion; reading stdout mid-flight can hand JSON.parse
+        // a half-written object.
+        stdout: StdioCollector {
+            id: searchStdout
+            waitForEnd: true
+        }
         
-        onStdoutChanged: {
-            var output = stdout.read();
+        onExited: (exitCode, exitStatus) => {
+            if (exitCode !== 0) return;
+
+            var output = searchStdout.text;
             if (!output) return;
             
             try {
@@ -227,6 +249,8 @@ PopupWindow {
                 for (var i = 0; i < items.length; i++) {
                     resultsModel.append(items[i]);
                 }
+                // `clear()` resets the index to -1; re-highlight the first hit.
+                resultsList.currentIndex = items.length > 0 ? 0 : -1;
             } catch (e) {
                 console.log("Failed to parse JSON: " + e);
             }
