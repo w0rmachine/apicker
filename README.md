@@ -153,6 +153,18 @@ apicker search --source files --root ~ --hidden --query env
 The flag also applies to `apicker rebuild-cache --hidden`; a cache built with hidden
 files is not reused for a normal search and vice-versa.
 
+### Calling `execute`
+
+Pass the result's `source` together with its `path`; omit the source for
+desktop or file items. `{item}` in a custom `action` is passed to the shell
+as a single argument, so `echo '{item}' | wl-copy` copies exactly the picked
+text, even when it contains quotes or `$`.
+
+```sh
+apicker execute --source ssh --item home-server
+apicker execute --source desktop --item ~/.local/share/applications/foo.desktop
+```
+
 ### 3. The Master Menu (`Super + M`)
 Bind `Super + M` to open a main launcher menu.
 * **The Call:** Your QML runs `apicker search --query ":"` (or an empty string).
