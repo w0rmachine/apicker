@@ -279,9 +279,16 @@ action = 'printf "%s" "{{item}}" > {}'
 fn default_execute_opens_the_item_with_xdg_open() {
     let env = TestEnv::new("xdg-open");
     let marker = env.root.join("xdg-marker");
+    let tmp = marker.with_extension("tmp");
+    // Write-then-rename so wait_for never reads a half-written file.
     env.executable(
         "xdg-open",
-        &format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", marker.display()),
+        &format!(
+            "#!/bin/sh\nprintf '%s' \"$1\" > '{}'; mv '{}' '{}'\n",
+            tmp.display(),
+            tmp.display(),
+            marker.display()
+        ),
     );
 
     let item = env.root.join("target file.txt");
