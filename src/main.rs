@@ -474,8 +474,9 @@ fn main() {
                     eprintln!("Source '{}' not found in configuration.", source_name);
                 }
             } else {
+                let sources_only = query.starts_with(':');
                 let search_query = query.strip_prefix(':').unwrap_or(&query);
-                let show_sources = query.is_empty() || search_query.len() < query.len();
+                let show_sources = query.is_empty() || sources_only;
 
                 if show_sources && !file_options_requested {
                     for src in &config.sources {
@@ -501,7 +502,8 @@ fn main() {
                     }
                 }
 
-                if !file_options_requested {
+                // ":" lists sources only; apps and files are skipped.
+                if !file_options_requested && !sources_only {
                     let desktop_provider = DesktopProvider {
                         exclude: &config.desktop_exclude,
                         desktops: Vec::new(),
@@ -509,15 +511,17 @@ fn main() {
                     results.extend(desktop_provider.fetch(search_query, &mru, &matcher));
                 }
 
-                let files_provider = FilesProvider {
-                    ignore_dirs: &final_ignores,
-                    root_dir: root.as_deref().or(config.root_dir.as_deref()),
-                    cache_ttl_seconds: config.cache_ttl_seconds,
-                    glob: glob.as_deref(),
-                    use_cache: !no_cache,
-                    include_hidden,
-                };
-                results.extend(files_provider.fetch(search_query, &mru, &matcher));
+                if !sources_only {
+                    let files_provider = FilesProvider {
+                        ignore_dirs: &final_ignores,
+                        root_dir: root.as_deref().or(config.root_dir.as_deref()),
+                        cache_ttl_seconds: config.cache_ttl_seconds,
+                        glob: glob.as_deref(),
+                        use_cache: !no_cache,
+                        include_hidden,
+                    };
+                    results.extend(files_provider.fetch(search_query, &mru, &matcher));
+                }
             }
 
             let by_rank = |a: &PickerItem, b: &PickerItem| {

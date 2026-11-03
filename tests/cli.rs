@@ -413,7 +413,76 @@ fn desktop_search_skips_hidden_entries_and_launches_by_path() {
     let mru: Value = serde_json::from_slice(&fs::read(env.mru_file()).unwrap()).unwrap();
     let counts = mru["counts"].as_object().unwrap();
     assert!(
-        counts.keys().any(|key| key.starts_with(app.to_str().unwrap())),
+        counts
+            .keys()
+            .any(|key| key.starts_with(app.to_str().unwrap())),
         "desktop MRU key should be the resolved argv: {counts:?}"
     );
+}
+
+#[test]
+fn colon_mode_lists_only_sources() {
+    let env = TestEnv::new("colon");
+    env.config(&source_config("power", "printf 'Shutdown\\n'", "true"));
+
+    let scan = env.root.join("scan");
+    env.write(scan.join("note.txt"), b"hello");
+    assert_success(&env.rebuild(&scan));
+
+    let app = env.executable("fake-app", "#!/bin/sh\nexit 0\n");
+    env.desktop(
+        &env.data_home,
+        "test.desktop",
+        &format!(
+            "[Desktop Entry]\nType=Application\nName=Test App\nExec={}\nIcon=app\n",
+            app.display()
+        ),
+    );
+
+    let sources = env.search(&["--query", ":"]);
+    let sources = sources.as_array().unwrap();
+    assert_eq!(
+        sources.len(),
+        1,
+        "colon mode leaked built-in results: {sources:?}"
+    );
+    assert_eq!(sources[0]["is_submenu"], true);
+    assert_eq!(sources[0]["target_source"], "power");
+
+    let filtered = env.search(&["--query", ":pow"]);
+    assert_eq!(filtered.as_array().unwrap().len(), 1);
+    assert_eq!(filtered[0]["path"], "power");
+
+    let none = env.search(&["--query", ":zzz"]);
+    assert!(none.as_array().unwrap().is_empty(), "{none}");
+}
+
+#[test]
+fn empty_query_lists_sources_and_apps() {
+    let env = TestEnv::new("empty-query");
+    env.config(&source_config("power", "printf 'Shutdown\\n'", "true"));
+
+    let scan = env.root.join("scan");
+    env.write(scan.join("note.txt"), b"hello");
+    assert_success(&env.rebuild(&scan));
+
+    let app = env.executable("fake-app", "#!/bin/sh\nexit 0\n");
+    env.desktop(
+        &env.data_home,
+        "test.desktop",
+        &format!(
+            "[Desktop Entry]\nType=Application\nName=Test App\nExec={}\nIcon=app\n",
+            app.display()
+        ),
+    );
+
+    // An empty query is the recent-files view upstream: files with no MRU
+    // history are dropped, so only sources and apps show up here.
+    let all = env.search(&["--query", ""]);
+    let all = all.as_array().unwrap();
+    assert!(
+        all.iter().any(|item| item["target_source"] == "power"),
+        "{all:?}"
+    );
+    assert!(all.iter().any(|item| item["text"] == "Test App"), "{all:?}");
 }
