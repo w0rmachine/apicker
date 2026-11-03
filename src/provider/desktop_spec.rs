@@ -352,11 +352,9 @@ pub fn exec_to_argv(
                         expanded.push_str(&path.to_string_lossy());
                     }
                 }
-                'i' => {
-                    if !entry.icon.is_empty() {
-                        icon_args.push("--icon".to_string());
-                        icon_args.push(entry.icon.clone());
-                    }
+                'i' if !entry.icon.is_empty() => {
+                    icon_args.push("--icon".to_string());
+                    icon_args.push(entry.icon.clone());
                 }
                 // Unknown field code: drop it.
                 _ => {}
