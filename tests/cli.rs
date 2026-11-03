@@ -69,6 +69,15 @@ impl TestEnv {
         path
     }
 
+    fn rebuild_hidden(&self, root: &Path) -> Output {
+        self.run(&[
+            "rebuild-cache",
+            "--root",
+            root.to_str().expect("test path is UTF-8"),
+            "--hidden",
+        ])
+    }
+
     fn desktop(&self, dir: &Path, name: &str, body: &str) {
         self.write(dir.join("applications").join(name), body.as_bytes());
     }
@@ -282,4 +291,77 @@ fn default_execute_opens_the_item_with_xdg_open() {
 
     let mru: Value = serde_json::from_slice(&fs::read(env.mru_file()).unwrap()).unwrap();
     assert_eq!(mru["counts"][item.to_str().unwrap()], 1);
+}
+
+#[test]
+fn files_cache_honors_ignores_and_search_uses_cached_kind_icons() {
+    let env = TestEnv::new("files");
+    env.config("ignore_dirs = [\"node_modules\"]\n");
+
+    let scan = env.root.join("scan");
+    let scan_str = scan.to_str().expect("test path is UTF-8");
+    env.write(scan.join("alpha.txt"), b"a");
+    env.write(scan.join("project/beta.rs"), b"b");
+    env.write(scan.join("project/node_modules/ignored.js"), b"c");
+    env.write(scan.join("node_modules/ignored.rs"), b"d");
+    env.write(scan.join(".hidden/secret.txt"), b"e");
+    env.write(scan.join(".dotfile"), b"f");
+
+    let out = env.rebuild(&scan);
+    assert_success(&out);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("4 items"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let cache = fs::read_to_string(env.cache_file()).unwrap();
+    assert!(cache.contains("alpha.txt"));
+    assert!(cache.contains("beta.rs"));
+    assert!(!cache.contains("node_modules"));
+    assert!(!cache.contains(".hidden"));
+    assert!(!cache.contains(".dotfile"));
+
+    let json = env.search(&["--source", "files", "--root", scan_str, "--query", "beta"]);
+    let items = json.as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["text"], "beta.rs");
+    assert_eq!(items[0]["icon"], "code-context");
+    assert_eq!(items[0]["is_dir"], false);
+    assert!(items[0]["path"]
+        .as_str()
+        .unwrap()
+        .ends_with("project/beta.rs"));
+
+    let json = env.search(&[
+        "--source", "files", "--root", scan_str, "--query", "project",
+    ]);
+    let project = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["path"].as_str().unwrap().ends_with("/project"))
+        .expect("project directory should be searchable");
+    assert_eq!(project["icon"], "folder");
+    assert_eq!(project["is_dir"], true);
+}
+
+#[test]
+fn files_search_can_index_hidden_entries() {
+    let env = TestEnv::new("hidden-search");
+    let scan = env.root.join("scan");
+    let scan_str = scan.to_str().expect("test path is UTF-8");
+    env.write(scan.join(".config/app.ini"), b"x");
+
+    let out = env.rebuild_hidden(&scan);
+    assert_success(&out);
+    let cache = fs::read_to_string(env.cache_file()).unwrap();
+    assert!(cache.contains(".config/app.ini"), "{cache}");
+
+    let json = env.search(&[
+        "--source", "files", "--root", scan_str, "--query", "app.ini", "--hidden",
+    ]);
+    let items = json.as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["text"], "app.ini");
 }
