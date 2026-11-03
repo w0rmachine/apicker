@@ -194,14 +194,18 @@ fn load_cache(
 /// Collect the entries under `root_dir` into a flat index.
 ///
 /// `ignore_dirs` is always honored; dotfiles are skipped unless
-/// `include_hidden` is set. `file_name != "."` keeps a `.` root directory from
-/// excluding itself.
+/// `include_hidden` is set. The root itself is never filtered, so an explicit
+/// hidden root such as `~/.config` is still indexed.
 fn scan_entries(root_dir: &Path, ignore_dirs: &[String], include_hidden: bool) -> Vec<CacheEntry> {
     WalkDir::new(root_dir)
         .into_iter()
         .filter_entry(|e| {
+            // The root itself is always scanned, so an explicit hidden root works.
+            if e.depth() == 0 {
+                return true;
+            }
             let file_name = e.file_name().to_string_lossy();
-            if !include_hidden && file_name.starts_with('.') && file_name != "." {
+            if !include_hidden && file_name.starts_with('.') {
                 return false;
             }
             if ignore_dirs
@@ -462,6 +466,19 @@ mod tests {
         assert!(hidden_names.contains(&"visible.txt".to_string()));
         assert!(hidden_names.contains(&".hidden.txt".to_string()));
         assert!(hidden_names.contains(&".hidden_dir".to_string()));
+    }
+
+    #[test]
+    fn explicit_hidden_root_is_scanned() {
+        let dir = fixture_dir();
+        let root = dir.join(".config");
+        fs::create_dir_all(root.join("app")).expect("create root");
+        fs::write(root.join("app/conf.ini"), "").expect("write file");
+        fs::write(root.join(".secret"), "").expect("write dotfile");
+
+        let names = file_names(&scan_entries(&root, &[], false));
+        assert!(names.contains(&"conf.ini".to_string()), "{names:?}");
+        assert!(!names.contains(&".secret".to_string()), "{names:?}");
     }
 
     #[test]
