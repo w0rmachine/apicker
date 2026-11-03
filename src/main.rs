@@ -272,10 +272,52 @@ fn run_source_script(script: &str, timeout: Duration) -> std::io::Result<Vec<Str
     Ok(items)
 }
 
-/// Shell-escape a string by wrapping it in single quotes with proper escaping.
-fn shell_escape(s: &str) -> String {
-    // Replace each ' with '\'' (end quote, escaped quote, start quote)
-    format!("'{}'", s.replace('\'', "'\\''"))
+/// Rewrite `{item}` into a positional shell argument, keeping its quote context.
+///
+/// The item is passed to `sh -c` as `$1`, so it is never parsed by the shell:
+/// an unquoted `{item}` becomes `"$1"`, one inside double quotes becomes `$1`,
+/// and a whole `'{item}'` becomes `'"$1"'`. Template authors get exactly the
+/// text that was picked, with no escaping to get wrong.
+fn action_script(template: &str) -> String {
+    let mut out = String::with_capacity(template.len() + 8);
+    let mut quote = None;
+    let mut i = 0;
+
+    while i < template.len() {
+        if template[i..].starts_with("{item}") {
+            match quote {
+                Some('\'') => out.push_str("'\"$1\"'"),
+                Some(_) => out.push_str("$1"),
+                None => out.push_str("\"$1\""),
+            }
+            i += "{item}".len();
+            continue;
+        }
+
+        let c = template[i..]
+            .chars()
+            .next()
+            .expect("index is a char boundary");
+        out.push(c);
+        let mut advance = c.len_utf8();
+
+        if c == '\\' && quote != Some('\'') {
+            if let Some(next) = template[i + advance..].chars().next() {
+                out.push(next);
+                advance += next.len_utf8();
+            }
+        } else if c == '\'' || c == '"' {
+            if quote == Some(c) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(c);
+            }
+        }
+
+        i += advance;
+    }
+
+    out
 }
 
 /// Launch a desktop entry by desktop-file path.
@@ -515,10 +557,12 @@ fn main() {
                 launch_desktop_entry(&item);
             } else if let Some(src_name) = source {
                 if let Some(src_config) = config.sources.iter().find(|s| s.name == src_name) {
-                    let escaped_item = shell_escape(&item);
-                    let expanded_cmd = src_config.action.replace("{item}", &escaped_item);
                     let mut command = std::process::Command::new("sh");
-                    command.arg("-c").arg(&expanded_cmd);
+                    command
+                        .arg("-c")
+                        .arg(action_script(&src_config.action))
+                        .arg("apicker")
+                        .arg(&item);
                     match spawn_detached(&mut command) {
                         Ok(_) => {}
                         Err(e) => eprintln!("Failed to spawn action process: {}", e),
@@ -560,7 +604,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::run_source_script;
+    use super::{action_script, run_source_script};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -580,6 +624,24 @@ mod tests {
             started.elapsed() < Duration::from_secs(3),
             "timeout took {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn action_placeholder_becomes_a_safe_positional_argument() {
+        assert_eq!(action_script("echo {item}"), r#"echo "$1""#);
+        assert_eq!(action_script(r#"echo "{item}""#), r#"echo "$1""#);
+        assert_eq!(
+            action_script("echo 'pre {item} post'"),
+            r#"echo 'pre '"$1"' post'"#
+        );
+    }
+
+    #[test]
+    fn action_placeholder_can_use_the_whole_single_quoted_argument() {
+        assert_eq!(
+            action_script("printf '%s' '{item}'"),
+            r#"printf '%s' ''"$1"''"#
         );
     }
 }
