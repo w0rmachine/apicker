@@ -56,6 +56,15 @@ PopupWindow {
             searchInput.forceActiveFocus();
             pickerPopup.scheduleSearch();
         }
+
+        // Jump straight into a source (e.g. "desktop" or "files").
+        function open(source) {
+            pickerPopup.visible = true;
+            searchInput.text = "";
+            pickerPopup.currentSource = source;
+            searchInput.forceActiveFocus();
+            pickerPopup.scheduleSearch();
+        }
         
         function hide() {
             pickerPopup.visible = false;

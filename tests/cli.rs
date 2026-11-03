@@ -365,3 +365,55 @@ fn files_search_can_index_hidden_entries() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["text"], "app.ini");
 }
+
+#[test]
+fn desktop_search_skips_hidden_entries_and_launches_by_path() {
+    let env = TestEnv::new("desktop");
+    let marker = env.root.join("desktop-marker");
+    let app = env.executable(
+        "test-app",
+        &format!("#!/bin/sh\nprintf 'launched' > '{}'\n", marker.display()),
+    );
+
+    env.desktop(
+        &env.data_home,
+        "test.desktop",
+        &format!(
+            "[Desktop Entry]\nType=Application\nName=Test App\nExec={} %U\nIcon=test-icon\n",
+            app.display()
+        ),
+    );
+    env.desktop(
+        &env.data_home,
+        "hidden.desktop",
+        &format!(
+            "[Desktop Entry]\nType=Application\nName=Hidden App\nExec={}\nNoDisplay=true\n",
+            app.display()
+        ),
+    );
+
+    let json = env.search(&["--source", "desktop", "--query", "test"]);
+    let items = json.as_array().unwrap();
+    assert_eq!(items.len(), 1, "unexpected desktop results: {items:?}");
+    assert_eq!(items[0]["text"], "Test App");
+    assert_eq!(items[0]["icon"], "test-icon");
+    let path = items[0]["path"].as_str().unwrap().to_string();
+    assert!(path.ends_with("/applications/test.desktop"), "{path}");
+
+    assert!(env
+        .search(&["--source", "desktop", "--query", "hidden"])
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let out = env.run(&["execute", "--source", "desktop", "--item", &path]);
+    assert_success(&out);
+    assert_eq!(wait_for(&marker), "launched");
+
+    let mru: Value = serde_json::from_slice(&fs::read(env.mru_file()).unwrap()).unwrap();
+    let counts = mru["counts"].as_object().unwrap();
+    assert!(
+        counts.keys().any(|key| key.starts_with(app.to_str().unwrap())),
+        "desktop MRU key should be the resolved argv: {counts:?}"
+    );
+}
