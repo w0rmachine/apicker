@@ -561,6 +561,7 @@ fn main() {
                 launch_desktop_entry(&item);
             } else if let Some(src_name) = source {
                 if let Some(src_config) = config.sources.iter().find(|s| s.name == src_name) {
+                    // "apicker" becomes $0 so the child opens $1, the item.
                     let mut command = std::process::Command::new("sh");
                     command
                         .arg("-c")
