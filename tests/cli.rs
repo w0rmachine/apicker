@@ -215,3 +215,71 @@ fn malformed_config_falls_back_to_empty_sources() {
     assert_eq!(json, Value::Array(Vec::new()));
     assert!(String::from_utf8_lossy(&out.stderr).contains("Error parsing config.toml"));
 }
+
+#[test]
+fn custom_source_search_filters_and_mru_boost_is_visible() {
+    let env = TestEnv::new("source-search");
+    env.config(&source_config(
+        "power",
+        "printf 'Shutdown\\nReboot\\nLogout\\n'",
+        "true",
+    ));
+
+    let out = env.run(&["execute", "--source", "power", "--item", "Shutdown"]);
+    assert_success(&out);
+
+    let json = env.search(&["--source", "power", "--query", "sh"]);
+    let items = json.as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["text"], "Shutdown");
+    assert!(items[0]["score"].as_i64().unwrap() >= 50);
+
+    let json = env.search(&["--source", "power", "--query", ""]);
+    assert_eq!(json[0]["text"], "Shutdown");
+}
+
+#[test]
+fn custom_action_receives_the_item_as_one_escaped_argument() {
+    let env = TestEnv::new("custom-action");
+    let marker = env.root.join("action-marker");
+    let config = format!(
+        r#"
+[[sources]]
+name = "tricky"
+icon = "test-icon"
+script = "printf \"Alice's PC\\n\""
+action = 'printf "%s" "{{item}}" > {}'
+"#,
+        marker.display()
+    );
+    env.config(&config);
+
+    let json = env.search(&["--source", "tricky", "--query", "alice"]);
+    let item = json[0]["path"].as_str().unwrap().to_string();
+    assert_eq!(item, "Alice's PC");
+
+    let out = env.run(&["execute", "--source", "tricky", "--item", &item]);
+    assert_success(&out);
+    assert_eq!(wait_for(&marker), item);
+
+    let mru: Value = serde_json::from_slice(&fs::read(env.mru_file()).unwrap()).unwrap();
+    assert_eq!(mru["counts"][&item], 1);
+}
+
+#[test]
+fn default_execute_opens_the_item_with_xdg_open() {
+    let env = TestEnv::new("xdg-open");
+    let marker = env.root.join("xdg-marker");
+    env.executable(
+        "xdg-open",
+        &format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", marker.display()),
+    );
+
+    let item = env.root.join("target file.txt");
+    let out = env.run(&["execute", "--item", item.to_str().unwrap()]);
+    assert_success(&out);
+    assert_eq!(wait_for(&marker), item.to_str().unwrap());
+
+    let mru: Value = serde_json::from_slice(&fs::read(env.mru_file()).unwrap()).unwrap();
+    assert_eq!(mru["counts"][item.to_str().unwrap()], 1);
+}
